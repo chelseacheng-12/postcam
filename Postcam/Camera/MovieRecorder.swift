@@ -19,7 +19,7 @@ enum RecordingFinish {
 final class MovieRecorder {
     private let context: CIContext
     private let lock = NSLock()
-    private let logger = Logger(subsystem: "com.postcam.app", category: "recorder")
+    private let logger = Logger(subsystem: "com.chelseacheng.postcam", category: "recorder")
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?

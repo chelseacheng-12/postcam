@@ -67,12 +67,12 @@ final class CameraController: NSObject, ObservableObject {
     private let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
-    private let sessionQueue = DispatchQueue(label: "com.postcam.app.session")
-    private let videoQueue = DispatchQueue(label: "com.postcam.app.video", qos: .userInteractive)
-    private let audioQueue = DispatchQueue(label: "com.postcam.app.audio", qos: .userInitiated)
+    private let sessionQueue = DispatchQueue(label: "com.chelseacheng.postcam.session")
+    private let videoQueue = DispatchQueue(label: "com.chelseacheng.postcam.video", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "com.chelseacheng.postcam.audio", qos: .userInitiated)
     private let frames: FramePublisher
     private let recorder: MovieRecorder
-    private let logger = Logger(subsystem: "com.postcam.app", category: "camera")
+    private let logger = Logger(subsystem: "com.chelseacheng.postcam", category: "camera")
 
     private let stateLock = NSLock()
     private var shared = Shared()

@@ -12,7 +12,7 @@ final class StampCompositor {
 
     private let cacheLock = NSLock()
     private let proofLock = NSLock()
-    private let renderQueue = DispatchQueue(label: "com.postcam.app.proof", qos: .userInitiated)
+    private let renderQueue = DispatchQueue(label: "com.chelseacheng.postcam.proof", qos: .userInitiated)
     private var cache: [String: (mask: CIImage, overlay: CIImage)] = [:]
     private var grain: CIImage?
     private var proofID = 0
