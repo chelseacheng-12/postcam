@@ -46,16 +46,10 @@ enum CameraError: LocalizedError {
 /// Live camera. Frames are stamped on the video queue, copied into a buffer we own,
 /// then shown and (while recording) encoded. Device configuration stays on `sessionQueue`.
 final class CameraController: NSObject, ObservableObject {
-    /// The video connection is left at the sensor's own landscape orientation for both cameras.
-    /// The app is portrait-only; frames are turned upright in Core Image with the values below.
+    /// The video connection is left at the sensor's own orientation, unmirrored, for both cameras.
+    /// The app is portrait-only; `handleVideo` turns frames upright in Core Image with a
+    /// `FrameOrientation` built from the rotation coordinator's angle and the buffer's shape.
     static let sensorRotation: CGFloat = 0
-    /// Raw back buffer to upright portrait: a quarter turn clockwise.
-    static let backOrientation: CGImagePropertyOrientation = .right
-    /// Raw front buffer to an upright, mirrored selfie view: a quarter turn and a left-right flip.
-    static let frontOrientation: CGImagePropertyOrientation = .leftMirrored
-    /// Raw front buffer to the true, un-mirrored view for saving. This is `.leftMirrored` flipped
-    /// back left to right, which is a plain quarter turn clockwise. `.left` would be upside down.
-    static let frontSavedOrientation: CGImagePropertyOrientation = .right
     /// The front camera previews mirrored, like a mirror. Saved photos and videos are flipped back
     /// to the true view, which is the iPhone Camera default. Set true to save them as previewed.
     static let saveFrontCameraMirrored = false
@@ -115,9 +109,16 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingThumbnail: UIImage?
 
     private var lastFramePosition: AVCaptureDevice.Position?
+    private var lastLoggedPosition: AVCaptureDevice.Position?
+    private var lastFrameOrientation: FrameOrientation?
     private let handTracker: HandFrameTracker
     private let postcardHistory: CelHistory
     private weak var previewSurface: PreviewSurface?
+    // Main thread only.
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservation: NSKeyValueObservation?
+    private var watchedDeviceID: String?
+    private weak var watchedLayer: CALayer?
     private let previewLock = NSLock()
 
     var metalDevice: MTLDevice? { compositor.metalDevice }
@@ -198,6 +199,40 @@ final class CameraController: NSObject, ObservableObject {
         previewLock.lock()
         previewSurface = preview
         previewLock.unlock()
+        sessionQueue.async {
+            guard let device = self.videoDevice else { return }
+            DispatchQueue.main.async {
+                self.watchRotation(of: device)
+                return
+            }
+        }
+    }
+
+    /// Main thread. Apple's rotation coordinator knows how each camera's sensor is mounted, including
+    /// front cameras that deliver portrait buffers. Its preview angle is the clockwise turn that makes
+    /// the raw buffer level on this screen. It needs the on-screen layer, so it waits for the preview.
+    private func watchRotation(of device: AVCaptureDevice) {
+        guard let layer = currentPreview()?.rotationLayer else { return }
+        if watchedDeviceID == device.uniqueID, watchedLayer === layer { return }
+        watchedDeviceID = device.uniqueID
+        watchedLayer = layer
+        rotationObservation?.invalidate()
+        let position = device.position
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: layer)
+        rotationCoordinator = coordinator
+        rotationObservation = coordinator.observe(
+            \.videoRotationAngleForHorizonLevelPreview,
+            options: [.initial, .new]
+        ) { [weak self] coordinator, _ in
+            self?.storeUprightAngle(coordinator.videoRotationAngleForHorizonLevelPreview, for: position)
+            return
+        }
+    }
+
+    private func storeUprightAngle(_ angle: CGFloat, for position: AVCaptureDevice.Position) {
+        stateLock.lock()
+        shared.uprightAngles[position] = angle
+        stateLock.unlock()
     }
 
     func setPreviewAspect(_ aspect: CGFloat) {
@@ -474,6 +509,7 @@ final class CameraController: NSObject, ObservableObject {
         let type = String(describing: device.deviceType)
         logger.info("Using \(name, privacy: .public) (\(type, privacy: .public))")
         DispatchQueue.main.async {
+            self.watchRotation(of: device)
             self.position = position
             self.backTorchAvailable = torch
             self.lenses = lenses
@@ -584,11 +620,8 @@ final class CameraController: NSObject, ObservableObject {
 
     private func applyFocus(at point: CGPoint, in viewSize: CGSize) {
         guard let device = videoDevice else { return }
-        let nx = point.x / viewSize.width
-        let ny = point.y / viewSize.height
-        let raw: CGPoint = currentPosition() == .front
-            ? CGPoint(x: ny, y: nx)
-            : CGPoint(x: ny, y: 1 - nx)
+        let screen = CGPoint(x: point.x / viewSize.width, y: point.y / viewSize.height)
+        let raw = currentShared().orientation.rawPoint(fromScreen: screen)
         let interest = CGPoint(x: min(max(raw.x, 0), 1), y: min(max(raw.y, 0), 1))
         do {
             try device.lockForConfiguration()
@@ -700,20 +733,35 @@ final class CameraController: NSObject, ObservableObject {
 
         let front = snapshot.position == .front
         let raw = CIImage(cvPixelBuffer: pixelBuffer)
+        let rawWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let uprightAngle = snapshot.uprightAngles[snapshot.position]
+        let orientation = FrameOrientation(
+            angle: uprightAngle,
+            bufferIsLandscape: rawWidth > rawHeight,
+            mirrored: front
+        )
         let image = raw
-            .oriented(front ? Self.frontOrientation : Self.backOrientation)
+            .oriented(orientation.imageOrientation)
             .normalizedOrigin()
             .croppedToEvenAspect(snapshot.previewAspect)
 
         if lastFramePosition != snapshot.position {
             lastFramePosition = snapshot.position
             postcardHistory.reset()
-            let rawWidth = CVPixelBufferGetWidth(pixelBuffer)
-            let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
+        }
+        if lastFrameOrientation != orientation || lastLoggedPosition != snapshot.position {
+            lastFrameOrientation = orientation
+            lastLoggedPosition = snapshot.position
+            stateLock.lock()
+            shared.orientation = orientation
+            stateLock.unlock()
             let side = front ? "front" : "back"
             let angle = Double(connection.videoRotationAngle)
             let mirrored = connection.isVideoMirrored
-            logger.info("\(side, privacy: .public) buffer \(rawWidth)x\(rawHeight) angle \(angle) mirrored \(mirrored)")
+            let coordinator = uprightAngle.map { "\(Int($0))" } ?? "none"
+            let turn = orientation.label
+            logger.info("\(side, privacy: .public) buffer \(rawWidth)x\(rawHeight) angle \(angle) mirrored \(mirrored) coordinator \(coordinator, privacy: .public) turn \(turn, privacy: .public)")
         }
         if !snapshot.hasFrame {
             stateLock.lock()
@@ -733,9 +781,9 @@ final class CameraController: NSObject, ObservableObject {
         guard let buffer = frames.render(output) else { return }
         let unmirror = front && !Self.saveFrontCameraMirrored
         // Sonny Boy frames have no text, so the rendered frame is flipped back left to right, which
-        // is the same as `frontSavedOrientation` on the raw buffer. The postcard stamp has printed
+        // is the same as `orientation.unmirrored` on the raw buffer. The postcard stamp has printed
         // text that a flip would write backwards: postcard photos are drawn again from the raw
-        // buffer at `frontSavedOrientation`, and postcard videos keep the previewed view.
+        // buffer at `orientation.unmirrored`, and postcard videos keep the previewed view.
         let flipForSave = unmirror && snapshot.artStyle == .sonnyBoy
 
         let recycle: (CVPixelBuffer) -> Void = { [weak self] buffer in
@@ -757,7 +805,7 @@ final class CameraController: NSObject, ObservableObject {
             let photoImage: CIImage
             if unmirror && snapshot.artStyle == .postcard {
                 let trueView = raw
-                    .oriented(Self.frontSavedOrientation)
+                    .oriented(orientation.unmirrored.imageOrientation)
                     .normalizedOrigin()
                     .croppedToEvenAspect(snapshot.previewAspect)
                 photoImage = compositor.composite(trueView, copy: copy)
@@ -809,6 +857,8 @@ final class CameraController: NSObject, ObservableObject {
         var hasFrame = false
         var artStyle: ArtStyle = .postcard
         var audioFormat: AudioStreamBasicDescription?
+        var uprightAngles: [AVCaptureDevice.Position: CGFloat] = [:]
+        var orientation = FrameOrientation(angle: nil, bufferIsLandscape: true, mirrored: false)
     }
 
     private func currentShared() -> Shared {

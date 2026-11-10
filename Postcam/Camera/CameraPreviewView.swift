@@ -5,6 +5,8 @@ import UIKit
 
 protocol PreviewSurface: AnyObject {
     var aspect: CGFloat { get }
+    /// The on-screen layer. The camera's rotation coordinator reads the screen orientation from it.
+    var rotationLayer: CALayer { get }
     func present(_ buffer: CVPixelBuffer, recycle: @escaping (CVPixelBuffer) -> Void)
     func showFocus(at point: CGPoint)
 }
@@ -30,6 +32,10 @@ final class CameraPreviewView: UIView, PreviewSurface {
 
     private var metalLayer: CAMetalLayer {
         layer as! CAMetalLayer
+    }
+
+    var rotationLayer: CALayer {
+        layer
     }
 
     var aspect: CGFloat {
