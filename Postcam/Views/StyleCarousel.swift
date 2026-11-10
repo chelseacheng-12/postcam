@@ -1,42 +1,81 @@
 import SwiftUI
 
+/// Snapping strip of art styles. The centered item is the selection, so a swipe selects
+/// and a tap scrolls the tapped style to the center.
 struct StyleCarousel: View {
     @ObservedObject var camera: CameraController
+    @State private var centered: ArtStyle?
+
+    private let itemWidth: CGFloat = 76
+    private let spacing: CGFloat = 10
+
+    init(camera: CameraController) {
+        self.camera = camera
+        _centered = State(initialValue: camera.artStyle)
+    }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 14) {
-                ForEach(ArtStyle.allCases) { style in
-                    Button {
-                        Haptic.select()
-                        camera.setArtStyle(style)
-                    } label: {
-                        VStack(spacing: 4) {
-                            StyleSwatch(style: style)
-                                .frame(width: 56, height: 36)
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .stroke(
-                                            camera.artStyle == style ? PostcamColor.cameraYellow : Color.white.opacity(0.35),
-                                            lineWidth: camera.artStyle == style ? 2 : 1
-                                        )
-                                }
-                            Text(style.title)
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(camera.artStyle == style ? PostcamColor.cameraYellow : Color.white.opacity(0.78))
-                                .lineLimit(1)
-                        }
-                        .frame(minWidth: 72)
+        GeometryReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: spacing) {
+                    ForEach(ArtStyle.allCases) { style in
+                        item(style)
+                            .frame(width: itemWidth)
+                            .id(style)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(style.title)
-                    .accessibilityAddTraits(camera.artStyle == style ? .isSelected : [])
                 }
+                .scrollTargetLayout()
             }
-            .padding(.horizontal, 2)
+            .contentMargins(.horizontal, max(0, (proxy.size.width - itemWidth) / 2), for: .scrollContent)
+            .scrollTargetBehavior(.viewAligned)
+            .scrollPosition(id: $centered)
         }
-        .frame(height: 58)
+        .frame(height: 60)
+        .opacity(camera.isRecording ? 0.4 : 1)
+        .allowsHitTesting(!camera.isRecording)
+        .onChange(of: centered) { _, newValue in
+            guard let newValue, newValue != camera.artStyle else { return }
+            Haptic.select()
+            camera.setArtStyle(newValue)
+        }
+        .onChange(of: camera.artStyle) { _, newValue in
+            guard centered != newValue else { return }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                centered = newValue
+            }
+        }
+    }
+
+    private func item(_ style: ArtStyle) -> some View {
+        let selected = camera.artStyle == style
+        return Button {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                centered = style
+            }
+        } label: {
+            VStack(spacing: 4) {
+                StyleSwatch(style: style)
+                    .frame(width: 56, height: 36)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(
+                                selected ? PostcamColor.cameraYellow : Color.white.opacity(0.35),
+                                lineWidth: selected ? 2 : 1
+                            )
+                    }
+                Text(style.title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(selected ? PostcamColor.cameraYellow : Color.white.opacity(0.78))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .frame(width: itemWidth)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(style.title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 

@@ -10,12 +10,10 @@ final class StampCompositor {
     let context: CIContext
 
     private let cacheLock = NSLock()
-    private let proofLock = NSLock()
-    private let renderQueue = DispatchQueue(label: "com.chelseacheng.postcam.proof", qos: .userInitiated)
+    private let renderQueue = DispatchQueue(label: "com.chelseacheng.postcam.warmup", qos: .userInitiated)
     private var cache: [String: (mask: CIImage, overlay: CIImage)] = [:]
     private var grain: CIImage?
     private var wobble: CIImage?
-    private var proofID = 0
 
     init() {
         if let device = MTLCreateSystemDefaultDevice() {
@@ -70,32 +68,6 @@ final class StampCompositor {
         let scale = min(1, maxPixel / longest)
         let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)).normalizedOrigin()
         return uiImage(from: scaled)
-    }
-
-    /// Settings-sheet proof. Stale renders (the user kept typing) come back as nil.
-    func proof(copy: StampCopy) async -> UIImage? {
-        let id: Int = proofLock.sync {
-            proofID += 1
-            return proofID
-        }
-        return await withCheckedContinuation { continuation in
-            renderQueue.async {
-                let stillCurrent = self.proofLock.sync { self.proofID == id }
-                guard stillCurrent else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let image = self.makeProof(copy: copy)
-                let fresh = self.proofLock.sync { self.proofID == id }
-                continuation.resume(returning: fresh ? image : nil)
-            }
-        }
-    }
-
-    private func makeProof(copy: StampCopy) -> UIImage? {
-        let extent = CGRect(x: 0, y: 0, width: 720, height: 1280)
-        let scene = StampSampleScene.make(extent: extent)
-        return uiImage(from: composite(scene, copy: copy))
     }
 
     private func prepared(_ image: CIImage) -> CIImage {
@@ -260,41 +232,5 @@ final class StampCompositor {
         ]).cropped(to: rect)
         guard let cgImage = context.createCGImage(soft, from: rect) else { return fallback }
         return CIImage(cgImage: cgImage)
-    }
-}
-
-private extension NSLock {
-    func sync<T>(_ body: () -> T) -> T {
-        lock()
-        defer { unlock() }
-        return body()
-    }
-}
-
-/// Flat stand-in for the street reference, so the settings sheet can show the real stamp
-/// without a camera frame. Not a photograph.
-enum StampSampleScene {
-    static func make(extent: CGRect) -> CIImage {
-        let width = extent.width
-        let height = extent.height
-        var image = CIImage(color: CIColor(red: 0.86, green: 0.91, blue: 0.93)).cropped(to: extent)
-        image = paint(CGRect(x: 0, y: height * 0.42, width: width * 0.28, height: height * 0.38), CIColor(red: 0.93, green: 0.86, blue: 0.80), image)
-        image = paint(CGRect(x: width * 0.22, y: height * 0.48, width: width * 0.22, height: height * 0.34), CIColor(red: 0.78, green: 0.83, blue: 0.86), image)
-        image = paint(CGRect(x: width * 0.40, y: height * 0.40, width: width * 0.24, height: height * 0.44), CIColor(red: 0.91, green: 0.78, blue: 0.74), image)
-        image = paint(CGRect(x: width * 0.62, y: height * 0.46, width: width * 0.38, height: height * 0.36), CIColor(red: 0.95, green: 0.90, blue: 0.82), image)
-        image = paint(CGRect(x: 0, y: 0, width: width, height: height * 0.46), CIColor(red: 0.80, green: 0.67, blue: 0.64), image)
-        let mark = CIColor(red: 0.95, green: 0.78, blue: 0.22)
-        image = paint(CGRect(x: width * 0.16, y: height * 0.22, width: width * 0.12, height: max(2, height * 0.012)), mark, image)
-        image = paint(CGRect(x: width * 0.40, y: height * 0.22, width: width * 0.12, height: max(2, height * 0.012)), mark, image)
-        image = paint(CGRect(x: width * 0.64, y: height * 0.22, width: width * 0.12, height: max(2, height * 0.012)), mark, image)
-        image = paint(CGRect(x: width * 0.08, y: height * 0.24, width: width * 0.28, height: height * 0.16), CIColor(red: 0.82, green: 0.28, blue: 0.18), image)
-        image = paint(CGRect(x: width * 0.10, y: height * 0.33, width: width * 0.24, height: height * 0.032), CIColor(red: 0.22, green: 0.40, blue: 0.68), image)
-        image = paint(CGRect(x: width * 0.50, y: height * 0.16, width: width * 0.34, height: height * 0.18), CIColor(red: 0.89, green: 0.40, blue: 0.22), image)
-        image = paint(CGRect(x: width * 0.53, y: height * 0.27, width: width * 0.28, height: height * 0.034), CIColor(red: 0.20, green: 0.36, blue: 0.62), image)
-        return image
-    }
-
-    private static func paint(_ rect: CGRect, _ color: CIColor, _ image: CIImage) -> CIImage {
-        CIImage(color: color).cropped(to: rect).composited(over: image)
     }
 }
