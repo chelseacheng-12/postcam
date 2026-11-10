@@ -7,6 +7,31 @@ struct StampCopy: Equatable {
     var caption: String
     var denomination: String
     var place: String
+    /// Stamp width as a fraction of the frame width. Shared by the preview and saved media.
+    var widthFraction: CGFloat
+}
+
+enum StampScale: String, CaseIterable {
+    case small
+    case medium
+    case large
+
+    var widthFraction: CGFloat {
+        switch self {
+        case .small: return 0.55
+        case .medium: return 0.72
+        case .large: return 0.88
+        }
+    }
+
+    /// Large, then medium, then small, then back to large.
+    var next: StampScale {
+        switch self {
+        case .large: return .medium
+        case .medium: return .small
+        case .small: return .large
+        }
+    }
 }
 
 enum StampDate {
@@ -35,6 +60,7 @@ final class StampSettings: ObservableObject {
         didSet { store(place, key: Key.place, limit: 18) { place = $0 } }
     }
     @Published private(set) var revision = 0
+    @Published private(set) var scale: StampScale
 
     private struct Fields {
         var label: String
@@ -46,7 +72,12 @@ final class StampSettings: ObservableObject {
     private let lock = NSLock()
     private var fields: Fields
     private var cachedDateString: String
+    private var displayedFraction: CGFloat
     private var isStoring = false
+    private var animationTimer: Timer?
+    private var animationStart: CGFloat = 0
+    private var animationEnd: CGFloat = 0
+    private var animationStartTime: CFAbsoluteTime = 0
 
     init() {
         let defaults = UserDefaults.standard
@@ -54,26 +85,50 @@ final class StampSettings: ObservableObject {
         let caption = String((defaults.string(forKey: Key.caption) ?? Default.caption).prefix(42))
         let denomination = String((defaults.string(forKey: Key.denomination) ?? Default.denomination).prefix(8))
         let place = String((defaults.string(forKey: Key.place) ?? Default.place).prefix(18))
+        let scale = StampScale(rawValue: defaults.string(forKey: Key.scale) ?? "") ?? .large
         self.label = label
         self.caption = caption
         self.denomination = denomination
         self.place = place
+        self.scale = scale
         fields = Fields(label: label, caption: caption, denomination: denomination, place: place)
         cachedDateString = StampDate.string(from: Date())
+        displayedFraction = scale.widthFraction
     }
 
     func copyForCurrentFrame() -> StampCopy {
         lock.lock()
         let snapshot = fields
         let date = cachedDateString
+        let fraction = displayedFraction
         lock.unlock()
         return StampCopy(
             date: date,
             label: snapshot.label.trimmingCharacters(in: .whitespacesAndNewlines),
             caption: snapshot.caption.trimmingCharacters(in: .whitespacesAndNewlines),
             denomination: snapshot.denomination.trimmingCharacters(in: .whitespacesAndNewlines),
-            place: snapshot.place.trimmingCharacters(in: .whitespacesAndNewlines)
+            place: snapshot.place.trimmingCharacters(in: .whitespacesAndNewlines),
+            widthFraction: fraction
         )
+    }
+
+    func currentWidthFraction() -> CGFloat {
+        lock.lock()
+        defer { lock.unlock() }
+        return displayedFraction
+    }
+
+    func cycleScale() {
+        setScale(scale.next)
+    }
+
+    func setScale(_ newScale: StampScale) {
+        if scale != newScale {
+            scale = newScale
+            UserDefaults.standard.set(newScale.rawValue, forKey: Key.scale)
+            revision += 1
+        }
+        animateDisplayedFraction(to: newScale.widthFraction)
     }
 
     func refreshDate(to date: Date = Date()) {
@@ -123,10 +178,60 @@ final class StampSettings: ObservableObject {
         static let place = "HONGKONG"
     }
 
+    private func animateDisplayedFraction(to target: CGFloat) {
+        lock.lock()
+        animationStart = displayedFraction
+        lock.unlock()
+        animationEnd = target
+        animationStartTime = CFAbsoluteTimeGetCurrent()
+        animationTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            self.tickAnimation(timer)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    private func tickAnimation(_ timer: Timer) {
+        let duration = 0.46
+        let elapsed = CFAbsoluteTimeGetCurrent() - animationStartTime
+        if elapsed >= duration {
+            setDisplayedFraction(animationEnd)
+            timer.invalidate()
+            if animationTimer === timer {
+                animationTimer = nil
+            }
+            revision += 1
+            return
+        }
+        let t = CGFloat(elapsed / duration)
+        let eased = springEase(min(max(t, 0), 1))
+        setDisplayedFraction(animationStart + (animationEnd - animationStart) * eased)
+    }
+
+    /// Slight overshoot, settled at 1. t is 0...1.
+    private func springEase(_ t: CGFloat) -> CGFloat {
+        let time = Double(t)
+        let decay = exp(-4.4 * time)
+        let wobble = cos(8.5 * time)
+        return CGFloat(1 - decay * wobble)
+    }
+
+    private func setDisplayedFraction(_ value: CGFloat) {
+        lock.lock()
+        displayedFraction = value
+        lock.unlock()
+    }
+
     private enum Key {
         static let label = "postcam.stamp.label"
         static let caption = "postcam.stamp.caption"
         static let denomination = "postcam.stamp.denomination"
         static let place = "postcam.stamp.place"
+        static let scale = "postcam.stamp.scale"
     }
 }

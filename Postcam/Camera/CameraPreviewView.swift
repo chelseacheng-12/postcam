@@ -19,6 +19,9 @@ final class CameraPreviewView: UIView, PreviewSurface {
     private var ciContext: CIContext?
     private let reticle = CAShapeLayer()
     private var hideReticle: DispatchWorkItem?
+    private var pendingFocus: DispatchWorkItem?
+    private var burstCommit: DispatchWorkItem?
+    private var stampTapsInBurst = 0
     private let aspectLock = NSLock()
     private var cachedAspect: CGFloat = 9.0 / 19.5
     private var didConfigureMetal = false
@@ -135,7 +138,8 @@ final class CameraPreviewView: UIView, PreviewSurface {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
         let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
-        tap.require(toFail: doubleTap)
+        // Stamp taps fire immediately. Waiting on the double-tap recognizer made the resize feel late.
+        // A double-tap still resets zoom and undoes any stamp steps from that pair of taps.
         addGestureRecognizer(pinch)
         addGestureRecognizer(tap)
         addGestureRecognizer(doubleTap)
@@ -155,11 +159,60 @@ final class CameraPreviewView: UIView, PreviewSurface {
     }
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        camera?.focus(at: gesture.location(in: self), in: bounds.size)
+        let point = gesture.location(in: self)
+        if stampContains(point) {
+            pendingFocus?.cancel()
+            camera?.cycleStampSize()
+            stampTapsInBurst += 1
+            scheduleBurstCommit()
+            return
+        }
+        scheduleFocus(at: point)
     }
 
     @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+        pendingFocus?.cancel()
+        burstCommit?.cancel()
+        if stampTapsInBurst > 0 {
+            camera?.revertStampBurst()
+            stampTapsInBurst = 0
+        }
         camera?.resetZoom()
+        return
+    }
+
+    private func scheduleFocus(at point: CGPoint) {
+        pendingFocus?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.camera?.focus(at: point, in: self.bounds.size)
+            return
+        }
+        pendingFocus = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.26, execute: work)
+    }
+
+    private func scheduleBurstCommit() {
+        burstCommit?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.stampTapsInBurst = 0
+            self.camera?.commitStampBurst()
+            return
+        }
+        burstCommit = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func stampContains(_ point: CGPoint) -> Bool {
+        guard bounds.width > 1, bounds.height > 1 else { return false }
+        let fraction = camera?.stampWidthFraction() ?? StampScale.large.widthFraction
+        let layout = StampGeometry.layout(
+            in: CGRect(origin: .zero, size: bounds.size),
+            widthFraction: fraction
+        )
+        let imagePoint = CGPoint(x: point.x, y: bounds.height - point.y)
+        return layout.path.contains(imagePoint)
     }
 
     private func fadeReticle() {

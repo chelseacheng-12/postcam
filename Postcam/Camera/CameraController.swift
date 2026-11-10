@@ -90,6 +90,7 @@ final class CameraController: NSObject, ObservableObject {
     private var recordTimer: Timer?
     private var recordingStarted = Date()
     private var lastPhotoTime: CFAbsoluteTime = 0
+    private var burstOrigin: StampScale?
 
     // Video queue only.
     private var capturePhotoOnNextFrame = false
@@ -304,6 +305,28 @@ final class CameraController: NSObject, ObservableObject {
         guard viewSize.width > 1, viewSize.height > 1 else { return }
         currentPreview()?.showFocus(at: point)
         sessionQueue.async { self.applyFocus(at: point, in: viewSize) }
+    }
+
+    func stampWidthFraction() -> CGFloat {
+        settings.currentWidthFraction()
+    }
+
+    func cycleStampSize() {
+        if burstOrigin == nil {
+            burstOrigin = settings.scale
+        }
+        settings.cycleScale()
+        Haptic.light()
+    }
+
+    func revertStampBurst() {
+        guard let origin = burstOrigin else { return }
+        burstOrigin = nil
+        settings.setScale(origin)
+    }
+
+    func commitStampBurst() {
+        burstOrigin = nil
     }
 
     // MARK: - Session
