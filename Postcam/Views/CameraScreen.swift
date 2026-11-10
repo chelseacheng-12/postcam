@@ -4,7 +4,6 @@ import UIKit
 struct CameraScreen: View {
     @ObservedObject var model: AppModel
     @State private var showAlbum = false
-    @State private var showSettings = false
 
     private var camera: CameraController { model.camera }
 
@@ -60,11 +59,6 @@ struct CameraScreen: View {
             AlbumView(model: model)
                 .onAppear { camera.stop() }
         }
-        .sheet(isPresented: $showSettings) {
-            StampSettingsView(settings: model.settings, compositor: model.compositor)
-                .presentationDetents([.large])
-                .presentationDragIndicator(.visible)
-        }
     }
 
     private var topBar: some View {
@@ -72,7 +66,6 @@ struct CameraScreen: View {
             HStack {
                 flashButton
                 Spacer()
-                settingsButton
             }
             if camera.isRecording {
                 recordingBadge
@@ -99,21 +92,6 @@ struct CameraScreen: View {
         .shadow(color: .black.opacity(0.45), radius: 2, y: 0)
     }
 
-    private var settingsButton: some View {
-        Button {
-            showSettings = true
-        } label: {
-            Image(systemName: "gearshape")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Stamp text")
-        .shadow(color: .black.opacity(0.45), radius: 2, y: 0)
-    }
-
     private var recordingBadge: some View {
         HStack(spacing: 6) {
             Circle()
@@ -131,7 +109,11 @@ struct CameraScreen: View {
 
     private var bottomCluster: some View {
         VStack(spacing: 16) {
-            ZoomControls(camera: camera)
+            // Pills and the live factor are not in the tree unless a zoom gesture is underway.
+            if camera.isAdjustingZoom {
+                ZoomControls(camera: camera)
+                    .transition(.opacity)
+            }
             modeSelector
             HStack {
                 albumButton
@@ -144,8 +126,10 @@ struct CameraScreen: View {
                 flipButton
                     .frame(width: 64)
             }
+            StyleCarousel(camera: camera)
         }
         .padding(.horizontal, 22)
+        .animation(.easeOut(duration: 0.45), value: camera.isAdjustingZoom)
     }
 
     private var modeSelector: some View {
@@ -181,7 +165,7 @@ struct CameraScreen: View {
         } label: {
             Text(mode.title)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(camera.mode == mode ? PostcamColor.modePinkColor : Color.white.opacity(0.72))
+                .foregroundStyle(camera.mode == mode ? PostcamColor.cameraYellow : Color.white.opacity(0.72))
                 .shadow(color: .black.opacity(0.45), radius: 2, y: 0)
                 .frame(minWidth: 64, minHeight: 32)
                 .animation(.easeInOut(duration: 0.2), value: camera.mode)

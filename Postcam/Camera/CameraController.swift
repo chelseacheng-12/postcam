@@ -22,6 +22,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 
 private enum ModeKey {
     static let captureMode = "postcam.capture.mode"
+    static let artStyle = "postcam.art.style"
 }
 
 enum CameraError: LocalizedError {
@@ -51,6 +52,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published var authorization: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
     @Published var unavailableReason: String?
     @Published var mode: CaptureMode
+    @Published var artStyle: ArtStyle
     @Published var isRecording = false
     @Published var recordingDuration: TimeInterval = 0
     @Published var lenses: [LensChoice] = [LensChoice(displayFactor: 1, deviceZoom: 1)]
@@ -102,6 +104,7 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingThumbnail: UIImage?
     private var didLogFrame = false
 
+    private let handTracker = HandFrameTracker()
     private weak var previewSurface: PreviewSurface?
     private let previewLock = NSLock()
 
@@ -115,12 +118,17 @@ final class CameraController: NSObject, ObservableObject {
 
     init(compositor: StampCompositor, settings: StampSettings) {
         let storedMode = UserDefaults.standard.string(forKey: ModeKey.captureMode) ?? ""
+        let storedStyle = UserDefaults.standard.string(forKey: ModeKey.artStyle) ?? ""
         mode = CaptureMode(rawValue: storedMode) ?? .photo
+        artStyle = ArtStyle(rawValue: storedStyle) ?? .postcard
         self.compositor = compositor
         self.settings = settings
         frames = FramePublisher(context: compositor.context)
         recorder = MovieRecorder(context: compositor.context)
         super.init()
+        stateLock.lock()
+        shared.artStyle = artStyle
+        stateLock.unlock()
         installObservers()
     }
 
@@ -194,6 +202,15 @@ final class CameraController: NSObject, ObservableObject {
         if mode == .video, position == .front, flashEnabled {
             flashEnabled = false
         }
+    }
+
+    func setArtStyle(_ style: ArtStyle) {
+        guard artStyle != style else { return }
+        artStyle = style
+        UserDefaults.standard.set(style.rawValue, forKey: ModeKey.artStyle)
+        stateLock.lock()
+        shared.artStyle = style
+        stateLock.unlock()
     }
 
     func toggleFlash() {
@@ -674,8 +691,14 @@ final class CameraController: NSObject, ObservableObject {
             stateLock.unlock()
         }
 
-        let stamped = compositor.composite(image, copy: settings.copyForCurrentFrame())
-        guard let buffer = frames.render(stamped) else { return }
+        let output: CIImage
+        switch snapshot.artStyle {
+        case .postcard:
+            output = compositor.composite(image, copy: settings.copyForCurrentFrame())
+        case .sonnyBoy:
+            output = handTracker.styled(image)
+        }
+        guard let buffer = frames.render(output) else { return }
 
         let recycle: (CVPixelBuffer) -> Void = { [weak self] buffer in
             self?.frames.recycle(buffer)
@@ -731,6 +754,7 @@ final class CameraController: NSObject, ObservableObject {
         var wantsRunning = false
         var wideZoom: CGFloat = 1
         var hasFrame = false
+        var artStyle: ArtStyle = .postcard
         var audioFormat: AudioStreamBasicDescription?
     }
 

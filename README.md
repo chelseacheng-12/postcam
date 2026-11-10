@@ -2,7 +2,7 @@
 
 Postcam is an iPhone camera. The viewfinder is a normal photo with a postage stamp in the middle. Inside the stamp the same scene is redrawn as flat anime background art: cel-shaded color and sketchy warm ink lines. Outside the stamp the camera is left alone. Photos and videos save that composite, not a clean frame with a sticker added later.
 
-The shooting controls follow the iPhone Camera app: pinch zoom, lens buttons, a photo/video shutter, flash, and a front/back switch. The stamp is the only postal piece. Album and settings stay light and ordinary so the picture can carry the idea.
+The shooting controls follow the iPhone Camera app: pinch zoom, a photo/video shutter, flash, and a front/back switch. A carousel under the shutter picks the art style. Album stays light and ordinary so the picture can carry the idea.
 
 ## Open and run
 
@@ -94,31 +94,26 @@ Use Xcode Cloud as the only way you upload. A local archive is also build 1 unti
 
 ## Shoot
 
-- **PHOTO / VIDEO** sits above the shutter. Photo is a white button. Video is red, and turns into a square while you are recording.
-- Pinch anywhere on the picture to zoom. Double-tap to come back to 1×. The pills are the lenses this phone actually has: usually 0.5×, 1×, and the next optical step, or 2× when there is no telephoto. 1× is the wide camera, which is where the app opens.
+- **PHOTO / VIDEO** sits above the shutter. The selected word is yellow. Photo is a white button. Video is red, and turns into a square while you are recording.
+- Pinch anywhere on the picture to zoom. While the pinch is active, the lens pills (0.5×, 1×, tele) and the live zoom readout appear. They fade out about a second after you let go. The idle screen has neither. Double-tap to come back to 1×. 1× is the wide camera, which is where the app opens.
 - Tap the picture to focus. The bolt is flash on the back camera (a short burst for photos, a torch while you are in video). The front camera uses the screen as a flash for photos.
-- The stamp is centered and about 55% of the frame width. What you see is what is written into the file, including the crop that fills the screen.
-- The round thumbnail opens the album. **Upload** there picks a photo from your library and prints the same stamp onto it.
+- The carousel under the shutter is the art style. Swipe it, or tap a style; the centered one is selected. **Postcard** is the anime stamp: a perforated frame, no words on it, and the drawing only inside the stamp. Tap the stamp to cycle its size. **Sonny Boy** has no stamp. The flat poster grade appears only inside a rectangle framed by both hands (thumb and index on each hand, like a director's frame). The rest of the picture stays the camera. The choice is remembered.
+- What you see is what is written into the file, including the crop that fills the screen and, for Sonny Boy, the hand window at that moment.
+- The round thumbnail opens the album. **Upload** there picks a photo from your library and applies the current style. Postcard prints the stamp. Sonny Boy grades the photo only where the same hand frame is in the picture.
 
 Saved files also go to the Photos library when you allow it. Postcam keeps its own copies either way, under Application Support.
 
-## Stamp text
+## Styles
 
-The gear opens the stamp sheet.
+Postcard and Sonny Boy are the cases of `ArtStyle`. A new style is another case, a swatch in `StyleSwatch`, and a branch in `CameraController.handleVideo`. The selected style is stored in UserDefaults under `postcam.art.style`.
 
-| Line | Default | Where it prints |
-| --- | --- | --- |
-| Date | The month you shoot or upload, `2026.09` | Top left, automatic |
-| Label | TRAVEL VLOG | Top right |
-| Caption | SPECIAL ADMINISTRATIVE REGION | Bottom left |
-| Denomination | 520 | Bottom right, in vermilion, above the place |
-| Place | HONGKONG | Bottom right |
+Sonny Boy's grade is `SonnyBoyStyle.Knob`. The hand window is `FramingPose` in `HandFrameTracker.swift`. It asks Vision for two hands, keeps a hand when the thumb and index form a loose L, and builds the quad from both hands' thumb tips, index tips, and thumb/index MCP joints. The mask is smoothed and fades out when the pose leaves. There is no stamp on this style.
 
-Lines print in capitals. The date is not edited by hand.
+The stamp itself has no lettering. The gear that used to edit stamp text is gone. Shape, perforations, and the tap-to-resize sizes remain for Postcard.
 
 ## If the drawing needs a nudge
 
-The anime chain is `IllustrationStyle.Knob` in `Postcam/Rendering/IllustrationStyle.swift`. Posterize levels, how much sky gradient to keep, line threshold, wobble, and ink color all live there. The scallop and the stamp widths are `StampGeometry` and `StampScale`.
+The Postcard chain is `IllustrationStyle.Knob` in `Postcam/Rendering/IllustrationStyle.swift`. Posterize levels, how much sky gradient to keep, line threshold, wobble, and ink color all live there. The scallop and the stamp widths are `StampGeometry` and `StampScale`. Sonny Boy's flat grade is `SonnyBoyStyle.Knob`.
 
 If the preview is sideways on a particular phone, the rotation applied to the camera buffer is `CameraController.portraitRotation` (90 degrees). The stamp bitmap is flipped once in `StampCompositor.upright(_:)` because a `CGImage` and a camera `CIImage` do not share an origin. If the stamp itself is upside down while the photo is upright, that function is the one to change.
 
@@ -131,9 +126,9 @@ project.yml
 Postcam/
   PostcamApp.swift          app entry, save + upload
   Info.plist                camera, microphone, photo library strings
-  Camera/                   session, zoom, recorder, metal preview
-  Rendering/                stamp geometry, anime filter, compositor
-  Views/                    camera chrome, album, viewer, stamp sheet
+  Camera/                   session, zoom, hand frame, recorder, metal preview
+  Rendering/                stamp geometry, Postcard and Sonny Boy filters, compositor
+  Views/                    camera chrome, style carousel, album, viewer
   Storage/                  in-app roll and Photos library
 ```
 
@@ -148,5 +143,6 @@ This project was written on a machine that cannot compile or run iOS apps. Nothi
 - Audio/video sync and the Photos library write
 - Which lens buttons appear on your specific iPhone
 - The anime grade against a real street, versus the flat background-art look described for this app
+- Sonny Boy's hand window against a real pair of hands. It has not been tried on a phone
 
 The filter values are a starting point for that comparison, not a finished grade.

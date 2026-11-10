@@ -13,9 +13,6 @@ struct ZoomControls: View {
                     .padding(.vertical, 5)
                     .background(Color.black.opacity(0.45), in: Capsule())
                     .offset(y: -34)
-                    .opacity(camera.isAdjustingZoom ? 1 : 0)
-                    .animation(.easeOut(duration: 0.3), value: camera.isAdjustingZoom)
-                    .accessibilityHidden(!camera.isAdjustingZoom)
                     .allowsHitTesting(false)
             }
     }

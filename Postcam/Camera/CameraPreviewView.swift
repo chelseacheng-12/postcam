@@ -205,6 +205,7 @@ final class CameraPreviewView: UIView, PreviewSurface {
     }
 
     private func stampContains(_ point: CGPoint) -> Bool {
+        guard camera?.artStyle == .postcard else { return false }
         guard bounds.width > 1, bounds.height > 1 else { return false }
         let fraction = camera?.stampWidthFraction() ?? StampScale.large.widthFraction
         let layout = StampGeometry.layout(
