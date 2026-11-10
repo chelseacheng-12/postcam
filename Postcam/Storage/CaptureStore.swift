@@ -1,3 +1,4 @@
+import Combine
 import UIKit
 
 /// Postcam's own roll. Files live in Application Support so a reinstall is the only way they disappear,
@@ -49,7 +50,7 @@ final class CaptureStore: ObservableObject {
     }
 
     @discardableResult
-    func saveVideo(from tempURL: URL, thumbnail: UIImage, duration: TimeInterval, date: Date) throws -> CaptureItem {
+    func saveVideo(from tempURL: URL, thumbnail preview: UIImage, duration: TimeInterval, date: Date) throws -> CaptureItem {
         let item = CaptureItem(id: UUID(), kind: .video, createdAt: date, duration: duration)
         let destination = mediaURL(for: item)
         do {
@@ -58,7 +59,9 @@ final class CaptureStore: ObservableObject {
             try FileManager.default.copyItem(at: tempURL, to: destination)
             try? FileManager.default.removeItem(at: tempURL)
         }
-        let thumb = thumbnail(from: thumbnail)
+        // The parameter used to be named `thumbnail`, which hid this method and
+        // made `thumbnail(from:)` look like a call on the UIImage.
+        let thumb = self.thumbnail(from: preview)
         if let thumbData = thumb.jpegData(compressionQuality: 0.8) {
             try? thumbData.write(to: thumbURL(for: item), options: .atomic)
         }

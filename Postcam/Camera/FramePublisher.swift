@@ -1,5 +1,7 @@
+import CoreGraphics
 import CoreImage
 import CoreVideo
+import Foundation
 
 /// Renders a filter graph into a buffer we own, synchronously, before the camera
 /// recycles the capture buffer. The preview can then upload that copy to Metal later.
