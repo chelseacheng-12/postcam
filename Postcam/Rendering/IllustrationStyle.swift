@@ -4,16 +4,23 @@ import CoreGraphics
 /// Anime background treatment used only inside the stamp.
 ///
 /// Flat cel color, warm charcoal line art, a little hand-drawn wobble.
-/// Edit `Knob` if the lines are too busy, the fills are too flat, or the ink is too heavy.
+/// Live frames pass a `CelHistory` so color, fills, and lines carry over from the last frame
+/// instead of being recomputed from camera noise. Stills pass nil.
 /// Heavy passes run at `workScale` so a 1080p preview can stay near 30fps.
 enum IllustrationStyle {
     enum Knob {
         /// Resolution of the smoothing and line passes, relative to the frame.
         static let workScale: CGFloat = 0.5
 
-        /// Edge-preserving smooth before the colors are flattened.
-        static let smoothNoise: Double = 0.025
-        static let smoothSharpness: Double = 0.42
+        /// Edge-preserving smooth before the colors are flattened. A median pass runs first.
+        static let smoothNoise: Double = 0.04
+        static let smoothSharpness: Double = 0.35
+        /// Extra blur on the color that gets posterized. Removes the speckle that made bands crawl.
+        static let colorBlur: Double = 1.2
+
+        /// Share of the previous frame kept, 0...1. Higher is calmer, with a little trail on fast pans.
+        static let colorKeep: CGFloat = 0.65
+        static let fillKeep: CGFloat = 0.5
 
         /// Posterize steps per channel. 5–8 reads as cel shading.
         static let posterizeLevels: Double = 6
@@ -23,18 +30,17 @@ enum IllustrationStyle {
         static let brightness: Double = 0.03
         static let contrast: Double = 1.05
 
-        /// CILineOverlay. Higher threshold and noise drop speckle; higher contrast crisps the ink.
-        static let lineNoise: Double = 0.04
-        static let lineSharpness: Double = 0.5
-        static let lineEdge: Double = 1.2
-        static let lineThreshold: Double = 0.15
-        static let lineContrast: Double = 58
-        /// Blur before the contrast boost, so stroke width varies a little.
-        static let lineSoften: Double = 0.4
-        /// Pixel shift of the ink. Small values wobble; large values tear the drawing.
-        static let wobbleScale: Double = 7
+        /// Contours. More blur and a higher threshold leave only strong outlines.
+        static let lineBlur: Double = 1.8
+        static let lineIntensity: Double = 2.4
+        static let lineThreshold: Double = 0.32
+        static let lineHysteresis: Double = 0.14
+        /// Antialiasing on the ink.
+        static let lineSoften: Double = 0.6
+        /// Pixel shift of the ink. The field is fixed on screen, so keep it small.
+        static let wobbleScale: Double = 3
         /// 0 is full ink. 1 removes the lines.
-        static let lineFade: Double = 0.08
+        static let lineFade: Double = 0.1
         /// 0 is full grain. 1 is a clean cel.
         static let grainFade: Double = 0.9
 
@@ -44,16 +50,37 @@ enum IllustrationStyle {
         static let inkBlue: CGFloat = 0.11
     }
 
-    static func apply(to image: CIImage, grain: CIImage, wobble: CIImage) -> CIImage {
+    static var inkSettings: StableInk.Settings {
+        StableInk.Settings(
+            blur: Knob.lineBlur,
+            intensity: Knob.lineIntensity,
+            threshold: Knob.lineThreshold,
+            hysteresis: Knob.lineHysteresis
+        )
+    }
+
+    static func apply(to image: CIImage, grain: CIImage, wobble: CIImage, history: CelHistory? = nil) -> CIImage {
         let source = image.normalizedOrigin()
         let extent = source.extent
         guard extent.width > 2, extent.height > 2, extent.isFinite else { return source }
 
-        let small = downscaled(source)
+        let small = downscaled(source, scale: Knob.workScale)
         let smallExtent = small.extent
-        let smoothed = smoothedColor(small)
-        let fills = celFills(from: smoothed, extent: smallExtent)
-        let lines = inkLines(from: smoothed, wobble: wobble, extent: smallExtent)
+
+        var smoothed = smoothedColor(small)
+        if let history {
+            smoothed = history.color.blend(smoothed, keep: Knob.colorKeep)
+        }
+
+        var fills = celFills(from: smoothed, extent: smallExtent)
+        if let history {
+            fills = history.fills.blend(fills, keep: Knob.fillKeep)
+        }
+
+        let previousLines = history?.lines.previous(matching: smallExtent)
+        let lineMask = StableInk.mask(from: smoothed, previous: previousLines, settings: inkSettings)
+        let storedLines = history?.lines.commit(lineMask) ?? lineMask
+        let lines = inkLines(mask: storedLines, wobble: wobble, extent: smallExtent)
 
         let inked = lines.applyingFilter("CIMultiplyBlendMode", parameters: [
             kCIInputBackgroundImageKey: fills
@@ -68,14 +95,17 @@ enum IllustrationStyle {
         return paperGrain(full, grain: grain, extent: extent)
     }
 
-    /// Noise reduction keeps object edges and wipes camera grit before posterizing.
-    private static func smoothedColor(_ image: CIImage) -> CIImage {
+    /// Median, then edge-preserving noise reduction, then a light blur. Camera grit is gone before
+    /// anything is quantized or traced.
+    static func smoothedColor(_ image: CIImage) -> CIImage {
         let extent = image.extent
         return image.clampedToExtent()
+            .applyingFilter("CIMedianFilter")
             .applyingFilter("CINoiseReduction", parameters: [
                 "inputNoiseLevel": Knob.smoothNoise,
                 "inputSharpness": Knob.smoothSharpness
             ])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: Knob.colorBlur])
             .cropped(to: extent)
     }
 
@@ -96,35 +126,13 @@ enum IllustrationStyle {
         ]).cropped(to: extent)
     }
 
-    /// Thresholded line overlay on the smoothed frame, then a low-frequency nudge.
-    private static func inkLines(from smoothed: CIImage, wobble: CIImage, extent: CGRect) -> CIImage {
-        let traced = smoothed.clampedToExtent()
-            .applyingFilter("CILineOverlay", parameters: [
-                "inputNRNoiseLevel": Knob.lineNoise,
-                "inputNRSharpness": Knob.lineSharpness,
-                "inputEdgeIntensity": Knob.lineEdge,
-                "inputThreshold": Knob.lineThreshold,
-                "inputContrast": Knob.lineContrast
-            ])
-            .cropped(to: extent)
-
-        let weighted = traced.clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [
-                kCIInputRadiusKey: Knob.lineSoften
-            ])
-            .cropped(to: extent)
-            .applyingFilter("CIColorControls", parameters: [
-                kCIInputSaturationKey: 0,
-                kCIInputBrightnessKey: -0.02,
-                kCIInputContrastKey: 1.45
-            ])
-            .cropped(to: extent)
-
-        let jittered = displace(weighted, wobble: wobble, extent: extent)
-        return jittered.applyingFilter("CIFalseColor", parameters: [
-            "inputColor0": CIColor(red: Knob.inkRed, green: Knob.inkGreen, blue: Knob.inkBlue),
-            "inputColor1": CIColor(red: 1, green: 1, blue: 1)
-        ]).cropped(to: extent)
+    private static func inkLines(mask: CIImage, wobble: CIImage, extent: CGRect) -> CIImage {
+        let ink = StableInk.ink(
+            mask.cropped(to: extent),
+            color: CIColor(red: Knob.inkRed, green: Knob.inkGreen, blue: Knob.inkBlue),
+            soften: Knob.lineSoften
+        )
+        return displace(ink, wobble: wobble, extent: extent)
     }
 
     private static func displace(_ image: CIImage, wobble: CIImage, extent: CGRect) -> CIImage {
@@ -161,9 +169,9 @@ enum IllustrationStyle {
         ]).cropped(to: extent)
     }
 
-    private static func downscaled(_ image: CIImage) -> CIImage {
+    static func downscaled(_ image: CIImage, scale: CGFloat) -> CIImage {
         let scaled = image
-            .transformed(by: CGAffineTransform(scaleX: Knob.workScale, y: Knob.workScale))
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .normalizedOrigin()
         var width = floor(scaled.extent.width)
         var height = floor(scaled.extent.height)
@@ -174,7 +182,7 @@ enum IllustrationStyle {
         return scaled.cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
     }
 
-    private static func upscaled(_ image: CIImage, to extent: CGRect) -> CIImage {
+    static func upscaled(_ image: CIImage, to extent: CGRect) -> CIImage {
         let source = image.normalizedOrigin()
         let scaleX = extent.width / max(source.extent.width, 1)
         let scaleY = extent.height / max(source.extent.height, 1)

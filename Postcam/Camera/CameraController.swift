@@ -48,6 +48,9 @@ final class CameraController: NSObject, ObservableObject {
     /// Portrait interface. Both cameras are rotated 90° clockwise into that orientation.
     /// If a device previews sideways, this is the number to change.
     static let portraitRotation: CGFloat = 90
+    /// The front camera previews mirrored, like a mirror. Saved photos and videos are flipped back
+    /// to the true view, which is the iPhone Camera default. Set true to save them as previewed.
+    static let saveFrontCameraMirrored = false
 
     @Published var authorization: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
     @Published var unavailableReason: String?
@@ -104,7 +107,9 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingThumbnail: UIImage?
     private var didLogFrame = false
 
-    private let handTracker = HandFrameTracker()
+    private var lastFramePosition: AVCaptureDevice.Position?
+    private let handTracker: HandFrameTracker
+    private let postcardHistory: CelHistory
     private weak var previewSurface: PreviewSurface?
     private let previewLock = NSLock()
 
@@ -125,6 +130,8 @@ final class CameraController: NSObject, ObservableObject {
         self.settings = settings
         frames = FramePublisher(context: compositor.context)
         recorder = MovieRecorder(context: compositor.context)
+        handTracker = HandFrameTracker(context: compositor.context)
+        postcardHistory = CelHistory(context: compositor.context)
         super.init()
         stateLock.lock()
         shared.artStyle = artStyle
@@ -672,14 +679,24 @@ final class CameraController: NSObject, ObservableObject {
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let snapshot = currentShared()
 
+        let front = snapshot.position == .front
         var image = CIImage(cvPixelBuffer: pixelBuffer)
         if image.extent.width > image.extent.height + 1 {
-            image = image.oriented(snapshot.position == .front ? .left : .right)
+            image = image.oriented(front ? .left : .right)
+        } else if front && snapshot.mirrorApplied {
+            // With the portrait rotation and mirroring both on the connection, front-camera frames
+            // arrive turned 180°. A half turn gives the upright mirrored selfie view.
+            image = image.oriented(.down)
         }
-        if snapshot.position == .front && !snapshot.mirrorApplied {
+        if front && !snapshot.mirrorApplied {
             image = image.oriented(.upMirrored)
         }
         image = image.normalizedOrigin().croppedToEvenAspect(snapshot.previewAspect)
+
+        if lastFramePosition != snapshot.position {
+            lastFramePosition = snapshot.position
+            postcardHistory.reset()
+        }
 
         if !didLogFrame {
             didLogFrame = true
@@ -691,14 +708,20 @@ final class CameraController: NSObject, ObservableObject {
             stateLock.unlock()
         }
 
+        let capturing = capturePhotoOnNextFrame
+        let copy = settings.copyForCurrentFrame()
         let output: CIImage
         switch snapshot.artStyle {
         case .postcard:
-            output = compositor.composite(image, copy: settings.copyForCurrentFrame())
+            output = compositor.composite(image, copy: copy, history: postcardHistory)
         case .sonnyBoy:
-            output = handTracker.styled(image)
+            output = handTracker.styled(image, forceFull: capturing)
         }
         guard let buffer = frames.render(output) else { return }
+        let unmirror = front && !Self.saveFrontCameraMirrored
+        // The postcard stamp has printed text, so flipping its output would write it backwards.
+        // Postcard videos keep the previewed view; postcard photos are drawn again from the true view.
+        let flipForSave = unmirror && snapshot.artStyle == .sonnyBoy
 
         let recycle: (CVPixelBuffer) -> Void = { [weak self] buffer in
             self?.frames.recycle(buffer)
@@ -707,16 +730,23 @@ final class CameraController: NSObject, ObservableObject {
 
         if recorder.isAccepting {
             if recordingThumbnail == nil {
-                recordingThumbnail = compositor.thumbnail(from: CIImage(cvPixelBuffer: buffer))
+                recordingThumbnail = compositor.thumbnail(from: Self.saved(buffer, mirrored: flipForSave))
             }
-            recorder.appendVideo(buffer, at: time)
+            recorder.appendVideo(buffer, at: time, mirrored: flipForSave)
         }
 
         if capturePhotoOnNextFrame {
             capturePhotoOnNextFrame = false
             let restoreTorch = turnTorchOffAfterPhoto
             turnTorchOffAfterPhoto = false
-            if let photo = compositor.uiImage(from: CIImage(cvPixelBuffer: buffer)) {
+            let photoImage: CIImage
+            if unmirror && snapshot.artStyle == .postcard {
+                let trueView = image.oriented(.upMirrored).normalizedOrigin()
+                photoImage = compositor.composite(trueView, copy: copy)
+            } else {
+                photoImage = Self.saved(buffer, mirrored: flipForSave)
+            }
+            if let photo = compositor.uiImage(from: photoImage) {
                 DispatchQueue.main.async {
                     self.onPhoto?(photo)
                     return
@@ -732,6 +762,12 @@ final class CameraController: NSObject, ObservableObject {
         } else {
             recycle(buffer)
         }
+    }
+
+    private static func saved(_ buffer: CVPixelBuffer, mirrored: Bool) -> CIImage {
+        let image = CIImage(cvPixelBuffer: buffer)
+        guard mirrored else { return image }
+        return image.oriented(.upMirrored).normalizedOrigin()
     }
 
     private func handleAudio(_ sampleBuffer: CMSampleBuffer) {

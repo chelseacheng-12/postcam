@@ -97,9 +97,10 @@ Use Xcode Cloud as the only way you upload. A local archive is also build 1 unti
 - **PHOTO / VIDEO** sits above the shutter. The selected word is yellow. Photo is a white button. Video is red, and turns into a square while you are recording.
 - Pinch anywhere on the picture to zoom. While the pinch is active, the lens pills (0.5×, 1×, tele) and the live zoom readout appear. They fade out about a second after you let go. The idle screen has neither. Double-tap to come back to 1×. 1× is the wide camera, which is where the app opens.
 - Tap the picture to focus. The bolt is flash on the back camera (a short burst for photos, a torch while you are in video). The front camera uses the screen as a flash for photos.
-- The carousel under the shutter is the art style. Swipe it, or tap a style; the centered one is selected. **Postcard** is the anime stamp: a perforated frame, no words on it, and the drawing only inside the stamp. Tap the stamp to cycle its size. **Sonny Boy** has no stamp. The flat poster grade appears only inside a rectangle framed by both hands (thumb and index on each hand, like a director's frame). The rest of the picture stays the camera. The choice is remembered.
-- What you see is what is written into the file, including the crop that fills the screen and, for Sonny Boy, the hand window at that moment.
-- The round thumbnail opens the album. **Upload** there picks a photo from your library and applies the current style. Postcard prints the stamp. Sonny Boy grades the photo only where the same hand frame is in the picture.
+- The carousel under the shutter is the art style. Swipe it, or tap a style; the centered one is selected. **Postcard** is the anime stamp: a perforated frame, no words on it, and the drawing only inside the stamp. Tap the stamp to cycle its size. **Sonny Boy** has no stamp. Inside a rectangle framed by both hands (thumb and index on each hand, like a director's frame), the scene turns into a flat cel-shaded world with surreal changes; see Styles. The rest of the picture stays the camera. The choice is remembered.
+- What you see is what is written into the file, including the crop that fills the screen and, for Sonny Boy, the hand window at that moment. A photo taken while the window is still fading in is saved at full strength.
+- The front camera previews like a mirror. Saved front-camera photos, and Sonny Boy videos, are flipped back to the true view, as the iPhone Camera app does. Postcard videos from the front camera are saved as previewed, because flipping them would write the stamp backwards. `CameraController.saveFrontCameraMirrored` saves everything as previewed instead.
+- The round thumbnail opens the album. **Upload** there picks a photo from your library and applies the current style. Postcard prints the stamp. Sonny Boy uses the hand window if one is in the picture, and otherwise turns the whole photo into the scene.
 
 Saved files also go to the Photos library when you allow it. Postcam keeps its own copies either way, under Application Support.
 
@@ -107,13 +108,17 @@ Saved files also go to the Photos library when you allow it. Postcam keeps its o
 
 Postcard and Sonny Boy are the cases of `ArtStyle`. A new style is another case, a swatch in `StyleSwatch`, and a branch in `CameraController.handleVideo`. The selected style is stored in UserDefaults under `postcam.art.style`.
 
-Sonny Boy's grade is `SonnyBoyStyle.Knob`. The hand window is `FramingPose` in `HandFrameTracker.swift`. It asks Vision for two hands, keeps a hand when the thumb and index form a loose L, and builds the quad from both hands' thumb tips, index tips, and thumb/index MCP joints. The mask is smoothed and fades out when the pose leaves. There is no stamp on this style.
+Sonny Boy is drawn by `SonnyBoyScene` (`Postcam/Rendering/SonnyBoyScene.swift`), with colors and cel values in `SonnyBoyStyle.Knob`. Each frame is flattened into a few saturated cel tones with thin dark outlines. Vision's person segmentation keeps people (cel-styled and outlined). Bright, flat areas above the window's horizon (ceilings, walls, plain sky) become a cobalt sky with flat white clouds, or blank cream space. The ground below can become a flat sea with wave lines, sand, grass, or more sky; when the bottom already looks like water, it becomes grass instead. One or two salient objects (Vision objectness saliency) are copied and float above where they stand, bobbing slowly. Which of these happens is a `SurrealPlan` picked from a seed for each new hand framing, so it holds still while the same framing lasts. The region masks are averaged over time so the edges do not flicker.
+
+The hand window is `FramingPose` in `HandFrameTracker.swift`. It asks Vision for two hands, keeps a hand when the thumb and index form a loose L, and builds the quad from both hands' thumb tips, index tips, and thumb/index MCP joints. The mask is smoothed and fades out when the pose leaves. There is no stamp on this style.
 
 The stamp itself has no lettering. The gear that used to edit stamp text is gone. Shape, perforations, and the tap-to-resize sizes remain for Postcard.
 
 ## If the drawing needs a nudge
 
-The Postcard chain is `IllustrationStyle.Knob` in `Postcam/Rendering/IllustrationStyle.swift`. Posterize levels, how much sky gradient to keep, line threshold, wobble, and ink color all live there. The scallop and the stamp widths are `StampGeometry` and `StampScale`. Sonny Boy's flat grade is `SonnyBoyStyle.Knob`.
+The Postcard chain is `IllustrationStyle.Knob` in `Postcam/Rendering/IllustrationStyle.swift`. Posterize levels, how much sky gradient to keep, line threshold, wobble, and ink color all live there.
+
+Both styles are made steady over time. The camera image is median-filtered and denoised before anything else. Colors and flat fills are blended with the previous frame (`colorKeep`, `fillKeep`; higher is calmer but trails more on fast pans) through `FrameHistory`. Lines use hysteresis (`StableInk`): an edge that was ink last frame stays ink at a lower threshold, so contours do not crawl, and fine texture under `lineThreshold` never inks. The wobble and grain are fixed textures made once, so they never shimmer. The history clears when you switch cameras or when frames stop for a moment. The scallop and the stamp widths are `StampGeometry` and `StampScale`. Sonny Boy's flat grade is `SonnyBoyStyle.Knob`.
 
 If the preview is sideways on a particular phone, the rotation applied to the camera buffer is `CameraController.portraitRotation` (90 degrees). The stamp bitmap is flipped once in `StampCompositor.upright(_:)` because a `CGImage` and a camera `CIImage` do not share an origin. If the stamp itself is upside down while the photo is upright, that function is the one to change.
 
@@ -139,7 +144,8 @@ This project was written on a machine that cannot compile or run iOS apps. Nothi
 - That the project opens and signs on your Xcode
 - The Xcode Cloud workflow, which is created in App Store Connect rather than in this repo
 - Preview frame rate of the Core Image chain
-- That saved photos and videos match the preview, including orientation and the front camera mirror
+- That saved photos and videos match the preview, including orientation and the front camera mirror. The front camera fix assumes frames arrive turned 180° when the connection does both the portrait rotation and the mirror. If the selfie preview is now upside down or sideways, change the `.down` turn in `CameraController.handleVideo`
+- The Sonny Boy sky and ground masks, which are heuristics on brightness, flatness, and position. They will misfire on some rooms
 - Audio/video sync and the Photos library write
 - Which lens buttons appear on your specific iPhone
 - The anime grade against a real street, versus the flat background-art look described for this app

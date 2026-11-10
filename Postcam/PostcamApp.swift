@@ -122,7 +122,7 @@ final class AppModel: ObservableObject {
         case .postcard:
             return compositor.composite(source, copy: copy)
         case .sonnyBoy:
-            return HandFrameTracker(still: true).styled(source)
+            return HandFrameTracker(context: compositor.context, still: true).styledStill(source)
         }
     }
 
