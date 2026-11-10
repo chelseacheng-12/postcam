@@ -1,3 +1,4 @@
+import Foundation
 import Photos
 
 enum LibrarySaveResult {
