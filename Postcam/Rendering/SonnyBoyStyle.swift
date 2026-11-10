@@ -155,7 +155,7 @@ enum SonnyBoyStyle {
 }
 
 /// Hand-drawn pieces for the swapped sky and ground, generated once per framing from a seed.
-/// Clouds are two-tone and flat. Waves and tufts are sparse strokes. Tiles are transparent.
+/// Clouds are painted cumulus from `SonnyBoyArt`. Waves and tufts are sparse strokes. Tiles are transparent.
 struct SonnyBoyTextures {
     let clouds: CIImage
     let waves: CIImage
@@ -163,12 +163,12 @@ struct SonnyBoyTextures {
 
     init(seed: UInt64) {
         var rng = SplitMix64(seed: seed)
-        clouds = SonnyBoyTextures.drawClouds(&rng)
+        clouds = SonnyBoyArt.paintedClouds(&rng)
         waves = SonnyBoyTextures.drawWaves(&rng)
         tufts = SonnyBoyTextures.drawTufts(&rng)
     }
 
-    private static func canvas(width: Int, height: Int) -> CGContext? {
+    static func canvas(width: Int, height: Int) -> CGContext? {
         CGContext(
             data: nil,
             width: width,
@@ -180,54 +180,12 @@ struct SonnyBoyTextures {
         )
     }
 
-    private static func finish(_ context: CGContext, width: Int, height: Int) -> CIImage {
+    static func finish(_ context: CGContext, width: Int, height: Int) -> CIImage {
         guard let image = context.makeImage() else {
             return CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0))
                 .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
         }
         return CIImage(cgImage: image)
-    }
-
-    private static func drawClouds(_ rng: inout SplitMix64) -> CIImage {
-        let width = 768
-        let height = 512
-        guard let context = canvas(width: width, height: height) else {
-            return CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0))
-                .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        let count = 3 + Int(rng.unit() * 2.99)
-        for index in 0..<count {
-            let slot = CGFloat(width) / CGFloat(count)
-            let cloudWidth = slot * (0.62 + rng.unit() * 0.3)
-            let left = slot * CGFloat(index) + (slot - cloudWidth) * 0.5
-            let base = CGFloat(height) * (0.12 + rng.unit() * 0.55)
-            let puffs = 4 + Int(rng.unit() * 3.99)
-            var circles: [CGRect] = []
-            for puff in 0..<puffs {
-                let t = (CGFloat(puff) + 0.5) / CGFloat(puffs)
-                let arch = 1 - abs(t - 0.5) * 1.4
-                let radius = cloudWidth * (0.12 + 0.12 * arch + rng.unit() * 0.05)
-                let x = left + cloudWidth * t
-                let y = base + radius * (0.35 + rng.unit() * 0.3)
-                circles.append(CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
-            }
-            let flatBottom = CGRect(x: left, y: base, width: cloudWidth, height: cloudWidth * 0.12)
-
-            let shade = SonnyBoyStyle.Knob.cloudShade
-            context.setFillColor(red: shade.red, green: shade.green, blue: shade.blue, alpha: 1)
-            for circle in circles {
-                context.fillEllipse(in: circle.offsetBy(dx: 0, dy: -circle.height * 0.08))
-            }
-            context.fill(flatBottom.offsetBy(dx: 0, dy: -flatBottom.height * 0.4))
-
-            context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
-            for circle in circles {
-                context.fillEllipse(in: circle.insetBy(dx: circle.width * 0.04, dy: circle.height * 0.04)
-                    .offsetBy(dx: 0, dy: circle.height * 0.05))
-            }
-        }
-        return finish(context, width: width, height: height)
     }
 
     private static func drawWaves(_ rng: inout SplitMix64) -> CIImage {
