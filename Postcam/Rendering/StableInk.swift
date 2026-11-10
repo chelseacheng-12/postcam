@@ -47,9 +47,11 @@ enum StableInk {
     /// Paper-white image with `color` lines, ready to multiply over fills.
     static func ink(_ mask: CIImage, color: CIColor, soften: Double) -> CIImage {
         let extent = mask.extent
-        let soft = mask.clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: soften])
-            .cropped(to: extent)
+        let soft = soften > 0
+            ? mask.clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: soften])
+                .cropped(to: extent)
+            : mask
         return soft.applyingFilter("CIFalseColor", parameters: [
             "inputColor0": CIColor(red: 1, green: 1, blue: 1),
             "inputColor1": color

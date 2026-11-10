@@ -4,8 +4,26 @@ import Foundation
 import Vision
 
 /// Finds the two-hand director's frame and returns a soft mask of the window inside it.
-/// Vision runs on every third frame. The quad is smoothed, and the mask fades out when the pose drops.
+/// Vision runs on every other frame. The quad is smoothed, held while at least one hand stays in
+/// view, and fades out when the hands leave.
 final class HandFrameTracker {
+    enum Knob {
+        /// Run hand pose on every Nth camera frame.
+        static let detectEvery = 2
+        /// Longest side of the image handed to Vision. Larger finds small, far hands; close-up
+        /// hands are found at any size.
+        static let detectLongestSide: CGFloat = 640
+        /// More than two so a stray third hand does not hide the pair that forms the frame.
+        static let maximumHands = 4
+        /// Seconds the last window stays at full strength after the frame breaks, while at least one
+        /// hand is still in view (one hand often drops out for a moment when close to the lens).
+        static let holdWithOneHand: CFTimeInterval = 0.8
+        /// Seconds before fading once no hand at all is in view.
+        static let holdWithNoHands: CFTimeInterval = 0.2
+        /// Fade-out speed, opacity per second.
+        static let fadePerSecond: CGFloat = 2.6
+    }
+
     private let request: VNDetectHumanHandPoseRequest
     private let still: Bool
     private let scene: SonnyBoyScene
@@ -13,6 +31,7 @@ final class HandFrameTracker {
     private var smoothed: [CGPoint] = []
     private var opacity: CGFloat = 0
     private var lastHit = CFAbsoluteTime(0)
+    private var lastHandSeen = CFAbsoluteTime(0)
     private var lastClock = CFAbsoluteTime(0)
     /// Counts hand frames. Each new one picks a new surreal plan; it holds for that framing.
     private var framing = 0
@@ -20,7 +39,7 @@ final class HandFrameTracker {
     /// `still` is for a single imported photo: a found frame is applied at full strength, with no fade.
     init(context: CIContext, still: Bool = false) {
         let request = VNDetectHumanHandPoseRequest()
-        request.maximumHandCount = 2
+        request.maximumHandCount = Knob.maximumHands
         self.request = request
         self.still = still
         let seed = still ? 0x5EED_C0DE : UInt64.random(in: 1...UInt64.max)
@@ -67,7 +86,7 @@ final class HandFrameTracker {
         let extent = source.extent
         guard extent.width > 2, extent.height > 2 else { return nil }
         frameIndex += 1
-        if frameIndex % 3 == 1 {
+        if Knob.detectEvery <= 1 || frameIndex % Knob.detectEvery == 1 {
             detect(in: source)
         }
         tickOpacity()
@@ -77,7 +96,7 @@ final class HandFrameTracker {
 
     private func detect(in image: CIImage) {
         let longest = max(image.extent.width, image.extent.height)
-        let scale = min(1, 480 / max(longest, 1))
+        let scale = min(1, Knob.detectLongestSide / max(longest, 1))
         let small = image
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .normalizedOrigin()
@@ -88,10 +107,11 @@ final class HandFrameTracker {
             return
         }
         let aspect = image.extent.width / max(image.extent.height, 1)
-        guard let observations = request.results,
-              let quad = FramingPose.quad(from: observations, aspect: aspect) else {
-            return
+        let observations = request.results ?? []
+        if !observations.isEmpty {
+            lastHandSeen = CFAbsoluteTimeGetCurrent()
         }
+        guard let quad = FramingPose.quad(from: observations, aspect: aspect) else { return }
         adopt(quad)
     }
 
@@ -120,8 +140,10 @@ final class HandFrameTracker {
         let now = CFAbsoluteTimeGetCurrent()
         let dt = lastClock == 0 ? 0 : now - lastClock
         lastClock = now
-        if !still, now - lastHit > 0.15 {
-            opacity = max(0, opacity - CGFloat(dt) * 2.6)
+        let handInView = now - lastHandSeen < Knob.holdWithNoHands + 0.15
+        let hold = handInView ? Knob.holdWithOneHand : Knob.holdWithNoHands
+        if !still, now - lastHit > hold {
+            opacity = max(0, opacity - CGFloat(dt) * Knob.fadePerSecond)
         }
         if opacity == 0 {
             smoothed = []
@@ -169,15 +191,47 @@ enum FramingPose {
     /// Returns four normalized, y-up corners ordered counterclockwise, or nil.
     /// `aspect` is width / height. Geometry runs with x scaled by it, so angles are true angles
     /// on a tall portrait frame.
+    enum Knob {
+        /// Vision confidence a fingertip and a finger base need. Low, because hands close to the lens
+        /// or at the frame edge come back with weak but usable points.
+        static let tipConfidence: Float = 0.04
+        static let baseConfidence: Float = 0.03
+        /// Allowed angle between thumb and index, degrees. Wide for perspective and loose L's.
+        static let minimumAngle: CGFloat = 20
+        static let maximumAngle: CGFloat = 170
+        /// Corners are pulled toward the center by this factor so the window sits inside the fingers.
+        static let inset: CGFloat = 0.95
+        /// Smallest window, as a share of the frame. There is no largest; big windows are clamped.
+        static let minimumArea: CGFloat = 0.004
+    }
+
+    /// Every pair of L-shaped hands is tried; the largest window wins.
     static func quad(from observations: [VNHumanHandPoseObservation], aspect: CGFloat) -> [CGPoint]? {
         let scaleX = max(aspect, 0.05)
         let hands = observations.compactMap { handL(from: $0, scaleX: scaleX) }
         guard hands.count >= 2 else { return nil }
-        guard let square = directorQuad(hands[0], hands[1]) else { return nil }
-        let inset = insetTowardCenter(square, factor: 0.9)
-        let normalized = inset.map { CGPoint(x: $0.x / scaleX, y: $0.y) }
-        guard isConvexCounterClockwise(normalized), area(normalized) > 0.012 else { return nil }
-        return normalized
+        var best: [CGPoint]?
+        var bestArea: CGFloat = 0
+        for first in 0..<(hands.count - 1) {
+            for second in (first + 1)..<hands.count {
+                guard let square = directorQuad(hands[first], hands[second]) else { continue }
+                let inset = insetTowardCenter(square, factor: Knob.inset)
+                let normalized = inset.map { CGPoint(x: $0.x / scaleX, y: $0.y) }
+                let window = clampedToFrame(normalized)
+                let size = area(window)
+                guard isConvexCounterClockwise(window), size > Knob.minimumArea, size > bestArea else { continue }
+                best = window
+                bestArea = size
+            }
+        }
+        return best
+    }
+
+    /// Keeps corners on the picture, so a frame held right at the lens covers the screen instead of
+    /// pointing off it. Falls back to the unclamped corners if clamping folds the shape.
+    private static func clampedToFrame(_ points: [CGPoint]) -> [CGPoint] {
+        let clamped = points.map { CGPoint(x: min(max($0.x, 0), 1), y: min(max($0.y, 0), 1)) }
+        return isConvexCounterClockwise(clamped) ? clamped : points
     }
 
     /// Rotates the new quad so each corner pairs with the nearest corner from the previous frame.
@@ -216,10 +270,17 @@ enum FramingPose {
     }
 
     private static func handL(from observation: VNHumanHandPoseObservation, scaleX: CGFloat) -> HandL? {
-        let indexTipPoint = joint(.indexTip, observation, minimum: 0.1)
-        let thumbTipPoint = joint(.thumbTip, observation, minimum: 0.1)
-        let indexBasePoint = joint(.indexMCP, observation, minimum: 0.08) ?? joint(.indexPIP, observation, minimum: 0.08)
-        let thumbBasePoint = joint(.thumbMP, observation, minimum: 0.08) ?? joint(.thumbIP, observation, minimum: 0.08)
+        // A fingertip cut off by the frame edge falls back to the next joint down the finger.
+        let tip = Knob.tipConfidence
+        let base = Knob.baseConfidence
+        let indexTipPoint = joint(.indexTip, observation, minimum: tip)
+            ?? joint(.indexDIP, observation, minimum: tip)
+        let thumbTipPoint = joint(.thumbTip, observation, minimum: tip)
+            ?? joint(.thumbIP, observation, minimum: tip)
+        let indexBasePoint = joint(.indexMCP, observation, minimum: base)
+            ?? joint(.indexPIP, observation, minimum: base)
+        let thumbBasePoint = joint(.thumbMP, observation, minimum: base)
+            ?? joint(.thumbCMC, observation, minimum: base)
         guard let indexTipPoint, let thumbTipPoint, let indexBasePoint, let thumbBasePoint else { return nil }
 
         let indexTip = CGPoint(x: indexTipPoint.x * scaleX, y: indexTipPoint.y)
@@ -230,12 +291,12 @@ enum FramingPose {
         let indexLength = distance(indexTip, indexMCP)
         let thumbLength = distance(thumbTip, thumbMCP)
         let opening = distance(indexTip, thumbTip)
-        guard indexLength > 0.02, thumbLength > 0.015, opening > 0.03 else { return nil }
+        guard indexLength > 0.01, thumbLength > 0.008, opening > 0.015 else { return nil }
         let indexDirection = CGPoint(x: indexTip.x - indexMCP.x, y: indexTip.y - indexMCP.y)
         let thumbDirection = CGPoint(x: thumbTip.x - thumbMCP.x, y: thumbTip.y - thumbMCP.y)
         let degrees = angleDegrees(indexDirection, thumbDirection)
         // About a right angle, with a wide allowance for perspective and a loose L.
-        guard degrees > 35, degrees < 155 else { return nil }
+        guard degrees > Knob.minimumAngle, degrees < Knob.maximumAngle else { return nil }
         return HandL(indexTip: indexTip, thumbTip: thumbTip, crotch: midpoint(indexMCP, thumbMCP))
     }
 
@@ -243,13 +304,13 @@ enum FramingPose {
     /// where the fingertips meet.
     private static func directorQuad(_ a: HandL, _ b: HandL) -> [CGPoint]? {
         let span = distance(a.crotch, b.crotch)
-        guard span > 0.05 else { return nil }
+        guard span > 0.03 else { return nil }
         let cross = distance(a.indexTip, b.thumbTip) + distance(a.thumbTip, b.indexTip)
         let same = distance(a.indexTip, b.indexTip) + distance(a.thumbTip, b.thumbTip)
         let closing = min(cross, same)
         let facing = opensToward(a, b.crotch) && opensToward(b, a.crotch)
         // Fingertips do not have to touch. Facing L's get more room than loosely placed ones.
-        let allowance = facing ? span * 1.1 + 0.08 : span * 0.6 + 0.04
+        let allowance = facing ? span * 1.6 + 0.12 : span * 1.0 + 0.08
         guard closing < allowance else { return nil }
 
         let indexMeetsThumb = cross <= same
@@ -266,7 +327,7 @@ enum FramingPose {
         let target = atan2(point.y - hand.crotch.y, point.x - hand.crotch.x)
         let sweep = signedAngle(from: start, to: end)
         let delta = signedAngle(from: start, to: target)
-        let slack: CGFloat = 0.65
+        let slack: CGFloat = 0.9
         if sweep >= 0 {
             return delta >= -slack && delta <= sweep + slack
         }

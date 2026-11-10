@@ -3,8 +3,9 @@ import CoreImage
 import Foundation
 
 /// Flat 2D cel look from Sonny Boy: bold clean color, almost no shading, thin dark outlines.
-/// `cel` is the pass for everything that is kept (people, objects). `SonnyBoyScene` swaps
-/// skies and ground around it.
+/// `cel` makes the flat fills at working resolution. `lineMask` traces the outlines at full
+/// resolution, so they stay thin and sharp instead of being scaled up with the fills.
+/// `SonnyBoyScene` swaps skies and ground around them.
 enum SonnyBoyStyle {
     enum Knob {
         static let posterizeLevels: Double = 5
@@ -16,11 +17,20 @@ enum SonnyBoyStyle {
         static let colorKeep: CGFloat = 0.65
         static let fillKeep: CGFloat = 0.5
 
-        static let lineBlur: Double = 1.4
-        static let lineIntensity: Double = 2.6
-        static let lineThreshold: Double = 0.34
-        static let lineHysteresis: Double = 0.14
-        static let lineSoften: Double = 0.5
+        /// Outlines, traced on the full-resolution frame. A 3×3 median removes sensor noise without
+        /// moving edges; `lineBlur` is only a light pre-smooth. Higher `lineThreshold` keeps fewer,
+        /// stronger contours. `lineHysteresis` keeps last frame's lines with less edge strength,
+        /// which is what holds them still while panning; nothing is blended or blurred over time.
+        static let lineBlur: Double = 0.8
+        static let lineIntensity: Double = 3.0
+        static let lineThreshold: Double = 0.4
+        static let lineHysteresis: Double = 0.16
+        /// Blur on the finished line. 0 is a hard, crisp edge.
+        static let lineSoften: Double = 0
+        /// A second 3×3 median on the finished lines removes lone specks and keeps lines 2px and wider.
+        static let despeckle = true
+        /// Width, in full-resolution pixels, of the outline where sky, ground, and people meet.
+        static let boundaryRadius: Double = 1
 
         /// Near-black ink with a cool cast, like the show's outlines.
         static let ink = CIColor(red: 0.10, green: 0.10, blue: 0.14)
@@ -45,7 +55,7 @@ enum SonnyBoyStyle {
         )
     }
 
-    /// `small` is already at working resolution with its origin at zero.
+    /// Flat fills, no lines. `small` is already at working resolution with its origin at zero.
     static func cel(_ small: CIImage, history: CelHistory?) -> CIImage {
         let extent = small.extent
         var smoothed = IllustrationStyle.smoothedColor(small)
@@ -68,13 +78,32 @@ enum SonnyBoyStyle {
         if let history {
             fills = history.fills.blend(fills, keep: Knob.fillKeep)
         }
+        return fills
+    }
 
-        let previous = history?.lines.previous(matching: extent)
-        let mask = StableInk.mask(from: smoothed, previous: previous, settings: inkSettings)
-        let stored = history?.lines.commit(mask) ?? mask
-        let ink = StableInk.ink(stored.cropped(to: extent), color: Knob.ink, soften: Knob.lineSoften)
+    /// White where there is an outline, black elsewhere, at the resolution of `full`.
+    /// `history` carries the binary lines between frames for hysteresis. Leave it nil for a still.
+    static func lineMask(_ full: CIImage, history: FrameHistory?) -> CIImage {
+        let extent = full.extent
+        let clean = full.clampedToExtent()
+            .applyingFilter("CIMedianFilter")
+            .cropped(to: extent)
+        let previous = history?.previous(matching: extent)
+        var mask = StableInk.mask(from: clean, previous: previous, settings: inkSettings)
+        if Knob.despeckle {
+            mask = mask.clampedToExtent()
+                .applyingFilter("CIMedianFilter")
+                .cropped(to: extent)
+        }
+        return history?.commit(mask) ?? mask
+    }
+
+    /// Multiplies `mask` lines in ink over `image`.
+    static func inked(_ image: CIImage, lines mask: CIImage) -> CIImage {
+        let extent = image.extent
+        let ink = StableInk.ink(mask.cropped(to: extent), color: Knob.ink, soften: Knob.lineSoften)
         return ink.applyingFilter("CIMultiplyBlendMode", parameters: [
-            kCIInputBackgroundImageKey: fills
+            kCIInputBackgroundImageKey: image
         ]).cropped(to: extent)
     }
 

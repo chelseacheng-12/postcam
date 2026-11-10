@@ -55,8 +55,10 @@ struct SurrealPlan {
 /// cobalt sky or blank space. Flat ground below becomes sea, sand, grass, or more sky.
 /// The most salient object can float above itself with a slow bob.
 ///
-/// Everything runs at `workScale`. Live mode reuses masks between Vision passes and smooths them
-/// over time. Still mode runs every pass once at full strength.
+/// Fills, Vision, and the region masks run at `workScale`; they are flat, so scaling them up costs
+/// nothing visible. The outlines are traced and drawn at full resolution after that, so they stay
+/// thin and sharp. Live mode reuses masks between Vision passes and smooths them over time.
+/// Still mode runs every pass once at full strength.
 final class SonnyBoyScene {
     enum Knob {
         static let workScale: CGFloat = 0.42
@@ -82,6 +84,7 @@ final class SonnyBoyScene {
     private let saliencyRequest = VNGenerateObjectnessBasedSaliencyImageRequest()
     private let cel: CelHistory?
     private let regions: FrameHistory?
+    private let lineHistory: FrameHistory?
     private let start = CFAbsoluteTimeGetCurrent()
 
     private var person: CIImage?
@@ -101,6 +104,7 @@ final class SonnyBoyScene {
         personRequest = request
         cel = still ? nil : CelHistory(context: context)
         regions = still ? nil : FrameHistory(context: context)
+        lineHistory = still ? nil : FrameHistory(context: context)
     }
 
     /// `horizon` is a 0...1 height, y-up. Surfaces above it may turn into sky; below it, ground.
@@ -123,33 +127,43 @@ final class SonnyBoyScene {
             findSalient(small)
         }
 
-        let base = SonnyBoyStyle.cel(small, history: cel)
-        let horizonY = extent.minY + extent.height * min(max(horizon, 0.05), 0.95)
-        let packed = regionMasks(small, horizonY: horizonY)
+        let base = IllustrationStyle.upscaled(SonnyBoyStyle.cel(small, history: cel), to: fullExtent)
+        let lines = SonnyBoyStyle.lineMask(full, history: lineHistory)
+        let level = min(max(horizon, 0.05), 0.95)
+        let packed = regionMasks(small, horizonY: extent.minY + extent.height * level)
         let stable = regions?.blend(packed, keep: Knob.regionKeep) ?? packed
-        let skyMask = alphaChannel(stable, index: 0)
-        let groundMask = alphaChannel(stable, index: 1)
 
         var scene = base
+        var ink = lines
         let time = CFAbsoluteTimeGetCurrent() - start
         if person != nil {
-            let upper = upperLayer(extent, horizonY: horizonY, time: time)
-            scene = upper.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            // Masks are smooth at working size; cutting them after the upscale gives sharp edges.
+            let masks = IllustrationStyle.upscaled(stable, to: fullExtent)
+            let sky = cut(grayChannel(masks, index: 0))
+            let ground = cut(grayChannel(masks, index: 1))
+            let people = cut(grayChannel(masks, index: 2))
+            let horizonY = fullExtent.minY + fullExtent.height * level
+            let upper = upperLayer(fullExtent, horizonY: horizonY, time: time)
+            scene = upper.applyingFilter("CIBlendWithMask", parameters: [
                 kCIInputBackgroundImageKey: scene,
-                kCIInputMaskImageKey: skyMask
-            ]).cropped(to: extent)
-            let ground = groundLayer(extent, horizonY: horizonY, time: time, upper: upper)
-            scene = ground.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputMaskImageKey: sky
+            ]).cropped(to: fullExtent)
+            let groundFill = groundLayer(fullExtent, horizonY: horizonY, time: time, upper: upper)
+            scene = groundFill.applyingFilter("CIBlendWithMask", parameters: [
                 kCIInputBackgroundImageKey: scene,
-                kCIInputMaskImageKey: groundMask
-            ]).cropped(to: extent)
-            scene = outlined(scene, packed: stable)
+                kCIInputMaskImageKey: ground
+            ]).cropped(to: fullExtent)
+            // Contours inside a swapped area belong to the old wall or floor, so they are dropped.
+            let kept = StableInk.affine(brighter(sky, ground), scale: -1, bias: 1)
+            ink = brighter(StableInk.multiply(lines, kept), boundaries(sky: sky, ground: ground, people: people))
         }
+        scene = SonnyBoyStyle.inked(scene, lines: ink)
 
         if plan.floats > 0, let box = floatBox {
-            scene = floating(base, over: scene, box: box, extent: extent, time: time)
+            let object = SonnyBoyStyle.inked(base, lines: lines)
+            scene = floating(object, over: scene, box: box, extent: fullExtent, time: time)
         }
-        return IllustrationStyle.upscaled(scene, to: fullExtent)
+        return scene
     }
 
     // MARK: - Plan
@@ -161,6 +175,7 @@ final class SonnyBoyScene {
         textures = SonnyBoyTextures(seed: plan.textureSeed)
         cel?.reset()
         regions?.reset()
+        lineHistory?.reset()
         floatBox = nil
         person = nil
     }
@@ -334,22 +349,18 @@ final class SonnyBoyScene {
         ]).cropped(to: extent)
     }
 
-    /// One channel of the packed masks as an alpha mask.
-    private func alphaChannel(_ packed: CIImage, index: Int) -> CIImage {
-        let extent = packed.extent
-        let pick = CIVector(
-            x: index == 0 ? 1 : 0,
-            y: index == 1 ? 1 : 0,
-            z: index == 2 ? 1 : 0,
-            w: 0
-        )
-        return packed.applyingFilter("CIColorMatrix", parameters: [
-            "inputRVector": pick,
-            "inputGVector": pick,
-            "inputBVector": pick,
-            "inputAVector": pick,
-            "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0)
-        ]).cropped(to: extent)
+    /// Hard 0-or-1 version of a gray mask.
+    private func cut(_ mask: CIImage) -> CIImage {
+        let extent = mask.extent
+        let binary = mask.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.5])
+            .cropped(to: extent)
+        return StableInk.opaque(binary)
+    }
+
+    /// Per-pixel maximum of two opaque gray masks.
+    private func brighter(_ a: CIImage, _ b: CIImage) -> CIImage {
+        a.applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: b])
+            .cropped(to: a.extent)
     }
 
     /// One channel of the packed masks as an opaque gray image.
@@ -432,21 +443,18 @@ final class SonnyBoyScene {
         }
     }
 
-    /// Thin dark lines where sky, ground, and people meet, so the swap reads as one drawing.
-    private func outlined(_ scene: CIImage, packed: CIImage) -> CIImage {
-        let extent = scene.extent
-        let skyRing = StableInk.outline(grayChannel(packed, index: 0), radius: 1)
-        let groundRing = StableInk.outline(grayChannel(packed, index: 1), radius: 1)
-        let personRing = StableInk.outline(grayChannel(packed, index: 2), radius: 1.2)
-        let rings = skyRing
-            .applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: groundRing])
-            .applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: personRing])
-            .cropped(to: extent)
-        let cut = rings.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.35]).cropped(to: extent)
-        let ink = StableInk.ink(cut, color: SonnyBoyStyle.Knob.ink, soften: 0.5)
-        return ink.applyingFilter("CIMultiplyBlendMode", parameters: [
-            kCIInputBackgroundImageKey: scene
-        ]).cropped(to: extent)
+    /// Thin lines where sky, ground, and people meet, so the swap reads as one drawing.
+    /// Traced on the sharp full-resolution masks, so the line is as thin as the image lines.
+    private func boundaries(sky: CIImage, ground: CIImage, people: CIImage) -> CIImage {
+        let extent = sky.extent
+        let radius = SonnyBoyStyle.Knob.boundaryRadius
+        let rings = brighter(
+            brighter(StableInk.outline(sky, radius: radius), StableInk.outline(ground, radius: radius)),
+            StableInk.outline(people, radius: radius)
+        )
+        return StableInk.opaque(
+            rings.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.5]).cropped(to: extent)
+        )
     }
 
     /// Copies the salient object and lifts it into the air, bobbing slowly.
@@ -468,7 +476,7 @@ final class SonnyBoyScene {
             return scene
         }
         let feather = shape.cropped(to: extent)
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 3])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 3 / Knob.workScale])
             .cropped(to: extent)
         let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: extent)
         let patch = base.applyingFilter("CIBlendWithAlphaMask", parameters: [
