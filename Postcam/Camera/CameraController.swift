@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import CoreImage
 import CoreMedia
+import ImageIO
 import Metal
 import os
 import UIKit
@@ -45,9 +46,16 @@ enum CameraError: LocalizedError {
 /// Live camera. Frames are stamped on the video queue, copied into a buffer we own,
 /// then shown and (while recording) encoded. Device configuration stays on `sessionQueue`.
 final class CameraController: NSObject, ObservableObject {
-    /// Portrait interface. Both cameras are rotated 90° clockwise into that orientation.
-    /// If a device previews sideways, this is the number to change.
-    static let portraitRotation: CGFloat = 90
+    /// The video connection is left at the sensor's own landscape orientation for both cameras.
+    /// The app is portrait-only; frames are turned upright in Core Image with the values below.
+    static let sensorRotation: CGFloat = 0
+    /// Raw back buffer to upright portrait: a quarter turn clockwise.
+    static let backOrientation: CGImagePropertyOrientation = .right
+    /// Raw front buffer to an upright, mirrored selfie view: a quarter turn and a left-right flip.
+    static let frontOrientation: CGImagePropertyOrientation = .leftMirrored
+    /// Raw front buffer to the true, un-mirrored view for saving. This is `.leftMirrored` flipped
+    /// back left to right, which is a plain quarter turn clockwise. `.left` would be upside down.
+    static let frontSavedOrientation: CGImagePropertyOrientation = .right
     /// The front camera previews mirrored, like a mirror. Saved photos and videos are flipped back
     /// to the true view, which is the iPhone Camera default. Set true to save them as previewed.
     static let saveFrontCameraMirrored = false
@@ -412,11 +420,13 @@ final class CameraController: NSObject, ObservableObject {
 
     private func configure(position: AVCaptureDevice.Position) throws {
         try configureSession(position: position)
-        // Swapping the input replaces the video connection when the configuration commits, and the
-        // new connection starts with no rotation and no mirroring. Settings applied inside the
-        // configuration block can land on the connection that is about to go away, so apply them
-        // again once the commit is done.
+        // Swapping the input can replace the video connection when the configuration commits.
+        // Assert the sensor settings again on whatever connection is live now.
         applyConnectionSettings(for: position)
+        // Frames are oriented by this position, so it changes only once the new input is live.
+        stateLock.lock()
+        shared.position = position
+        stateLock.unlock()
     }
 
     private func configureSession(position: AVCaptureDevice.Position) throws {
@@ -457,9 +467,6 @@ final class CameraController: NSObject, ObservableObject {
         let displayZoom = configureDevice(device)
 
         videoDevice = device
-        stateLock.lock()
-        shared.position = position
-        stateLock.unlock()
 
         let lenses = zoomMap.lenses
         let torch = device.hasTorch
@@ -483,21 +490,20 @@ final class CameraController: NSObject, ObservableObject {
         audioAdded = true
     }
 
-    /// Same for both cameras: portrait rotation on the connection, and the front camera mirrored
-    /// like a mirror. Each frame then reads the state of the connection it came from, so a frame
-    /// that slips through before these settings land is still drawn upright.
+    /// Same for both cameras: no rotation and no mirroring on the connection, so every buffer is the
+    /// raw landscape sensor image. `handleVideo` does all of the orientation in Core Image.
     private func applyConnectionSettings(for position: AVCaptureDevice.Position) {
         guard let connection = videoOutput.connection(with: .video) else {
             let name = String(describing: position)
             logger.info("No video connection yet for \(name, privacy: .public)")
             return
         }
-        if connection.isVideoRotationAngleSupported(Self.portraitRotation) {
-            connection.videoRotationAngle = Self.portraitRotation
+        if connection.isVideoRotationAngleSupported(Self.sensorRotation) {
+            connection.videoRotationAngle = Self.sensorRotation
         }
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = position == .front
+            connection.isVideoMirrored = false
         }
         let angle = Double(connection.videoRotationAngle)
         let mirrored = connection.isVideoMirrored
@@ -692,23 +698,12 @@ final class CameraController: NSObject, ObservableObject {
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let snapshot = currentShared()
 
-        let portPosition = connection.inputPorts.first?.sourceDevicePosition ?? .unspecified
-        let front = (portPosition == .unspecified ? snapshot.position : portPosition) == .front
-        let mirrored = connection.isVideoMirrored
-        var image = CIImage(cvPixelBuffer: pixelBuffer)
-        // Normal case for both cameras: the connection already rotated to portrait (and mirrored the
-        // front camera), so the buffer is used as is.
-        // Fallback when a buffer is still landscape: an unmirrored sensor buffer needs a quarter turn
-        // clockwise (.right) for either camera. A landscape buffer the connection already mirrored
-        // left to right would come out of that turn upside down, so it takes the counterclockwise
-        // turn (.left) instead. Both end up the same as the portrait case.
-        if image.extent.width > image.extent.height + 1 {
-            image = image.oriented(mirrored ? .left : .right)
-        }
-        if front && !mirrored {
-            image = image.oriented(.upMirrored)
-        }
-        image = image.normalizedOrigin().croppedToEvenAspect(snapshot.previewAspect)
+        let front = snapshot.position == .front
+        let raw = CIImage(cvPixelBuffer: pixelBuffer)
+        let image = raw
+            .oriented(front ? Self.frontOrientation : Self.backOrientation)
+            .normalizedOrigin()
+            .croppedToEvenAspect(snapshot.previewAspect)
 
         if lastFramePosition != snapshot.position {
             lastFramePosition = snapshot.position
@@ -717,6 +712,7 @@ final class CameraController: NSObject, ObservableObject {
             let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
             let side = front ? "front" : "back"
             let angle = Double(connection.videoRotationAngle)
+            let mirrored = connection.isVideoMirrored
             logger.info("\(side, privacy: .public) buffer \(rawWidth)x\(rawHeight) angle \(angle) mirrored \(mirrored)")
         }
         if !snapshot.hasFrame {
@@ -736,8 +732,10 @@ final class CameraController: NSObject, ObservableObject {
         }
         guard let buffer = frames.render(output) else { return }
         let unmirror = front && !Self.saveFrontCameraMirrored
-        // The postcard stamp has printed text, so flipping its output would write it backwards.
-        // Postcard videos keep the previewed view; postcard photos are drawn again from the true view.
+        // Sonny Boy frames have no text, so the rendered frame is flipped back left to right, which
+        // is the same as `frontSavedOrientation` on the raw buffer. The postcard stamp has printed
+        // text that a flip would write backwards: postcard photos are drawn again from the raw
+        // buffer at `frontSavedOrientation`, and postcard videos keep the previewed view.
         let flipForSave = unmirror && snapshot.artStyle == .sonnyBoy
 
         let recycle: (CVPixelBuffer) -> Void = { [weak self] buffer in
@@ -758,7 +756,10 @@ final class CameraController: NSObject, ObservableObject {
             turnTorchOffAfterPhoto = false
             let photoImage: CIImage
             if unmirror && snapshot.artStyle == .postcard {
-                let trueView = image.oriented(.upMirrored).normalizedOrigin()
+                let trueView = raw
+                    .oriented(Self.frontSavedOrientation)
+                    .normalizedOrigin()
+                    .croppedToEvenAspect(snapshot.previewAspect)
                 photoImage = compositor.composite(trueView, copy: copy)
             } else {
                 photoImage = Self.saved(buffer, mirrored: flipForSave)
