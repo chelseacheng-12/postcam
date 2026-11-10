@@ -38,13 +38,19 @@ final class StampCompositor {
         }
     }
 
-    func composite(_ image: CIImage, copy: StampCopy) -> CIImage {
+    /// `history` carries the live drawing between frames. Leave it nil for a single still.
+    func composite(_ image: CIImage, copy: StampCopy, history: CelHistory? = nil) -> CIImage {
         let source = prepared(image)
         let extent = source.extent
         guard extent.width > 8, extent.height > 8 else { return source }
         guard let artwork = artwork(for: extent, copy: copy) else { return source }
 
-        let stylized = IllustrationStyle.apply(to: source, grain: grainImage(), wobble: wobbleImage())
+        let stylized = IllustrationStyle.apply(
+            to: source,
+            grain: grainImage(),
+            wobble: wobbleImage(),
+            history: history
+        )
         let masked = stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: source,
             kCIInputMaskImageKey: artwork.mask
@@ -223,12 +229,13 @@ final class StampCompositor {
             return fallback
         }
         let blurred = random.clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 14])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 26])
             .cropped(to: rect)
+        // The wider blur flattens the field, so contrast comes back up to keep a gentle hand-drawn bend.
         let soft = blurred.applyingFilter("CIColorControls", parameters: [
             kCIInputSaturationKey: 0,
             kCIInputBrightnessKey: 0,
-            kCIInputContrastKey: 0.65
+            kCIInputContrastKey: 1.8
         ]).cropped(to: rect)
         guard let cgImage = context.createCGImage(soft, from: rect) else { return fallback }
         return CIImage(cgImage: cgImage)
