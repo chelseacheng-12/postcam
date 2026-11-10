@@ -37,27 +37,43 @@ final class AppModel: ObservableObject {
 
         camera.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+                return
+            }
             .store(in: &cancellables)
         store.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+                return
+            }
             .store(in: &cancellables)
         settings.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+                return
+            }
             .store(in: &cancellables)
 
         camera.onPhoto = { [weak self] image in
-            DispatchQueue.main.async { self?.savePhoto(image) }
+            DispatchQueue.main.async {
+                self?.savePhoto(image)
+                return
+            }
         }
         camera.onVideo = { [weak self] url, thumbnail, duration in
             DispatchQueue.main.async {
                 self?.saveVideo(tempURL: url, thumbnail: thumbnail, duration: duration)
+                return
             }
         }
         camera.onStatus = { [weak self] text in
-            DispatchQueue.main.async { self?.showBanner(text) }
+            DispatchQueue.main.async {
+                self?.showBanner(text)
+                return
+            }
         }
     }
 
