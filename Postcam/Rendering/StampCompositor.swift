@@ -4,7 +4,7 @@ import CoreText
 import Metal
 import UIKit
 
-/// Bakes the perforated frame, typewriter lines, and the crayon treatment inside the window.
+/// Bakes the perforated frame, typewriter lines, and the anime treatment inside the window.
 /// Mask and text are cached until the pixel size or the stamp copy changes.
 final class StampCompositor {
     let metalDevice: MTLDevice?
@@ -15,6 +15,7 @@ final class StampCompositor {
     private let renderQueue = DispatchQueue(label: "com.chelseacheng.postcam.proof", qos: .userInitiated)
     private var cache: [String: (mask: CIImage, overlay: CIImage)] = [:]
     private var grain: CIImage?
+    private var wobble: CIImage?
     private var proofID = 0
 
     init() {
@@ -35,7 +36,7 @@ final class StampCompositor {
             _ = self.grainImage()
             let extent = CGRect(x: 0, y: 0, width: 160, height: 160)
             let gray = CIImage(color: CIColor(red: 0.75, green: 0.62, blue: 0.58)).cropped(to: extent)
-            let styled = IllustrationStyle.apply(to: gray, grain: self.grainImage())
+            let styled = IllustrationStyle.apply(to: gray, grain: self.grainImage(), wobble: self.wobbleImage())
             _ = self.context.createCGImage(styled, from: styled.extent)
         }
     }
@@ -46,7 +47,7 @@ final class StampCompositor {
         guard extent.width > 8, extent.height > 8 else { return source }
         guard let artwork = artwork(for: extent, copy: copy) else { return source }
 
-        let stylized = IllustrationStyle.apply(to: source, grain: grainImage())
+        let stylized = IllustrationStyle.apply(to: source, grain: grainImage(), wobble: wobbleImage())
         let masked = stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: source,
             kCIInputMaskImageKey: artwork.mask
@@ -351,6 +352,42 @@ final class StampCompositor {
             kCIInputContrastKey: 0.25
         ]).cropped(to: rect)
         guard let cgImage = context.createCGImage(gray, from: rect) else { return fallback }
+        return CIImage(cgImage: cgImage)
+    }
+
+    private func wobbleImage() -> CIImage {
+        cacheLock.lock()
+        if let wobble {
+            cacheLock.unlock()
+            return wobble
+        }
+        cacheLock.unlock()
+
+        let made = makeWobble()
+        cacheLock.lock()
+        if wobble == nil { wobble = made }
+        let result = wobble ?? made
+        cacheLock.unlock()
+        return result
+    }
+
+    /// Low-frequency field, baked once so the ink wobble does not swim between frames.
+    private func makeWobble() -> CIImage {
+        let side: CGFloat = 256
+        let rect = CGRect(x: 0, y: 0, width: side, height: side)
+        let fallback = CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5)).cropped(to: rect)
+        guard let random = CIFilter(name: "CIRandomGenerator")?.outputImage?.cropped(to: rect) else {
+            return fallback
+        }
+        let blurred = random.clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 14])
+            .cropped(to: rect)
+        let soft = blurred.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0,
+            kCIInputBrightnessKey: 0,
+            kCIInputContrastKey: 0.65
+        ]).cropped(to: rect)
+        guard let cgImage = context.createCGImage(soft, from: rect) else { return fallback }
         return CIImage(cgImage: cgImage)
     }
 }

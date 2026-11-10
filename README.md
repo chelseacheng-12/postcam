@@ -1,6 +1,6 @@
 # Postcam
 
-Postcam is an iPhone camera. The viewfinder is a normal photo with a postage stamp in the middle. Inside the stamp the same scene is redrawn as crayon: posterized color, pencil lines, paper grain, and a pale pink grade. Outside the stamp the camera is left alone. Photos and videos save that composite, not a clean frame with a sticker added later.
+Postcam is an iPhone camera. The viewfinder is a normal photo with a postage stamp in the middle. Inside the stamp the same scene is redrawn as flat anime background art: cel-shaded color and sketchy warm ink lines. Outside the stamp the camera is left alone. Photos and videos save that composite, not a clean frame with a sticker added later.
 
 The shooting controls follow the iPhone Camera app: pinch zoom, lens buttons, a photo/video shutter, flash, and a front/back switch. The stamp is the only postal piece. Album and settings stay light and ordinary so the picture can carry the idea.
 
@@ -118,7 +118,7 @@ Lines print in capitals. The date is not edited by hand.
 
 ## If the drawing needs a nudge
 
-The crayon chain is `IllustrationStyle.Knob` in `Postcam/Rendering/IllustrationStyle.swift`. Brightness, posterize levels, how pink the wash is, and how heavy the pencil lines are all live there. The scallop and the 55% width are `StampGeometry`.
+The anime chain is `IllustrationStyle.Knob` in `Postcam/Rendering/IllustrationStyle.swift`. Posterize levels, how much sky gradient to keep, line threshold, wobble, and ink color all live there. The scallop and the stamp widths are `StampGeometry` and `StampScale`.
 
 If the preview is sideways on a particular phone, the rotation applied to the camera buffer is `CameraController.portraitRotation` (90 degrees). The stamp bitmap is flipped once in `StampCompositor.upright(_:)` because a `CGImage` and a camera `CIImage` do not share an origin. If the stamp itself is upside down while the photo is upright, that function is the one to change.
 
@@ -132,7 +132,7 @@ Postcam/
   PostcamApp.swift          app entry, save + upload
   Info.plist                camera, microphone, photo library strings
   Camera/                   session, zoom, recorder, metal preview
-  Rendering/                stamp geometry, crayon filter, compositor
+  Rendering/                stamp geometry, anime filter, compositor
   Views/                    camera chrome, album, viewer, stamp sheet
   Storage/                  in-app roll and Photos library
 ```
@@ -147,6 +147,6 @@ This project was written on a machine that cannot compile or run iOS apps. Nothi
 - That saved photos and videos match the preview, including orientation and the front camera mirror
 - Audio/video sync and the Photos library write
 - Which lens buttons appear on your specific iPhone
-- The exact crayon color against a real street, versus the reference described for this app
+- The anime grade against a real street, versus the flat background-art look described for this app
 
 The filter values are a starting point for that comparison, not a finished grade.
