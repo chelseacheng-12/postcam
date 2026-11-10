@@ -2,27 +2,34 @@ import CoreGraphics
 import CoreImage
 import Foundation
 
-/// Flat 2D painted look from Sonny Boy: smooth cel color with soft gradients, hard cool shadows,
-/// and thin dark outlines. `cel` makes the fills at working resolution: the frame is shrunk,
-/// median-filtered until photo texture is gone, then grown back with an edge-preserving upsample
-/// guided by the frame, so regions are flat but their borders follow the real edges.
-/// `painted` grows that to full resolution the same way. `lineMask` traces outlines on the
-/// flattened image at full resolution, so they stay thin and skip texture.
+/// Flat 2D cel look from Sonny Boy: every region one flat color with a hard border, one hard cool
+/// shadow tone, and thin dark outlines. `paint` works like this:
+/// - The working-size frame is shrunk and median-filtered until photo texture is gone, then grown
+///   to full resolution with an edge-preserving upsample guided by the full frame.
+/// - That smooth image is snapped to a small palette (k-means, then `CIPalettize`), so regions are
+///   flat and the borders between them are hard, pixel-sharp steps. A 3×3 median cleans stray
+///   pixels along those borders.
+/// - Shadows and outlines come from the palette regions, so they line up with the fills exactly.
 /// `SonnyBoyScene` swaps skies and ground around them.
 enum SonnyBoyStyle {
     enum Knob {
-        /// Flattening: the frame is shrunk to this share of working size and median-filtered
-        /// `flattenPasses` times. Smaller and more passes is flatter and more painted.
-        static let flattenScale: CGFloat = 0.32
-        static let flattenPasses = 3
-        static let flattenBlur: Double = 0.8
+        /// Texture removal: the working frame is shrunk to this share and median-filtered
+        /// `flattenPasses` times. Smaller and more passes paints over more detail.
+        static let flattenScale: CGFloat = 0.45
+        static let flattenPasses = 2
+        static let flattenBlur: Double = 0.6
         /// Edge-preserving upsample. `upsampleLuma` is how different two sides of an edge must be
-        /// to stay separate; lower keeps more detail, higher paints over more of it.
-        static let upsampleSpatial: Double = 3
-        static let upsampleLuma: Double = 0.14
-        /// 0 or 1 turns posterizing off. Above 1 adds hard color steps on top of the smooth fills.
-        static let posterizeLevels: Double = 0
-        static let gradientKeep: Double = 0.35
+        /// to stay separate; lower keeps more shapes, higher paints over more of them.
+        static let upsampleSpatial: Double = 2
+        static let upsampleLuma: Double = 0.08
+        /// Colors in the cel palette. More keeps more color variety; fewer is flatter and bolder.
+        static let paletteSize = 14
+        /// Share of working size the palette is learned from.
+        static let paletteSampleScale: CGFloat = 0.3
+        /// Share of last frame's palette kept, so colors do not jump.
+        static let paletteKeep: CGFloat = 0.6
+        /// 3×3 median passes on the snapped colors. Removes specks along region borders.
+        static let cleanupPasses = 2
 
         /// Bright, clean, high-key grade.
         static let exposure: Double = 0.3
@@ -33,20 +40,18 @@ enum SonnyBoyStyle {
         /// Slight cool cast in the light colors, like a painted background.
         static let coolLift: CGFloat = 0.03
 
-        /// Hard cel shadows: anything darker than `shadowLevel` (linear luminance of the
-        /// flattened image) is multiplied by `shadowTint`, with a hard edge.
+        /// Hard cel shadows: palette regions darker than `shadowLevel` (linear luminance) are
+        /// multiplied by `shadowTint`. No blur, so the shadow edge is the region edge.
         static let shadowLevel: Double = 0.075
-        static let shadowEdge: Double = 0.6
         static let shadowTint = CIColor(red: 0.66, green: 0.72, blue: 0.92)
 
         static let colorKeep: CGFloat = 0.65
-        static let fillKeep: CGFloat = 0.5
 
-        /// Outlines, traced at full resolution on the flattened image, so only borders between
-        /// painted regions get a line. `lineBlur` is only a light pre-smooth. Higher `lineThreshold`
+        /// Outlines, traced at full resolution on the palette regions, so only borders between
+        /// clearly different regions get a line. `lineBlur` is only a light pre-smooth. Higher `lineThreshold`
         /// keeps fewer, stronger contours. `lineHysteresis` keeps last frame's lines with less edge strength,
         /// which is what holds them still while panning; nothing is blended or blurred over time.
-        static let lineBlur: Double = 0.8
+        static let lineBlur: Double = 0.5
         static let lineIntensity: Double = 3.0
         static let lineThreshold: Double = 0.42
         static let lineHysteresis: Double = 0.16
@@ -79,42 +84,44 @@ enum SonnyBoyStyle {
         )
     }
 
-    /// Fills at working resolution, plus the flattened image before grading and shadows.
-    /// Outlines are traced on `structure`, so they follow region borders, not photo texture.
+    /// Full-resolution fills, plus the snapped palette regions before grading and shadows.
+    /// Outlines are traced on `regions`, so they sit exactly on fill borders.
     struct Layers {
         let fills: CIImage
-        let structure: CIImage
+        let regions: CIImage
     }
 
-    /// `small` is already at working resolution with its origin at zero.
-    static func cel(_ small: CIImage, history: CelHistory?) -> Layers {
-        let extent = small.extent
+    /// `full` is the frame with its origin at zero; `small` is it at working resolution.
+    /// `palette` carries the palette between frames. Leave both histories nil for a still.
+    static func paint(full: CIImage, small: CIImage, history: CelHistory?, palette: FrameHistory?) -> Layers {
+        let extent = full.extent
         let guide = IllustrationStyle.smoothedColor(small)
-        var structure = flattened(guide)
+        var flat = flattened(guide)
         if let history {
-            structure = history.color.blend(structure, keep: Knob.colorKeep)
+            flat = history.color.blend(flat, keep: Knob.colorKeep)
         }
+        let sharpGuide = full.clampedToExtent()
+            .applyingFilter("CIMedianFilter")
+            .cropped(to: extent)
+        let structure = guidedUpsample(flat, guide: sharpGuide)
 
-        var fills = structure
-        if Knob.posterizeLevels > 1 {
-            let stepped = structure.applyingFilter("CIColorPosterize", parameters: [
-                "inputLevels": Knob.posterizeLevels
+        var regions: CIImage
+        if let colors = paletteImage(from: flat, history: palette) {
+            regions = structure.applyingFilter("CIPalettize", parameters: [
+                "inputPaletteImage": colors,
+                "inputPerceptual": true
             ]).cropped(to: extent)
-            fills = stepped.applyingFilter("CIDissolveTransition", parameters: [
-                kCIInputTargetImageKey: structure,
-                kCIInputTimeKey: Knob.gradientKeep
-            ]).cropped(to: extent)
+        } else {
+            regions = structure.applyingFilter("CIColorPosterize", parameters: ["inputLevels": 6])
+                .cropped(to: extent)
         }
-        fills = shaded(graded(fills), structure: structure)
-        if let history {
-            fills = history.fills.blend(fills, keep: Knob.fillKeep)
+        for _ in 0..<Knob.cleanupPasses {
+            regions = regions.clampedToExtent()
+                .applyingFilter("CIMedianFilter")
+                .cropped(to: extent)
         }
-        return Layers(fills: fills, structure: structure)
-    }
-
-    /// Grows a working-resolution layer to the size of `full`, snapping its borders to the edges in `full`.
-    static func painted(_ layer: CIImage, full: CIImage) -> CIImage {
-        upsample(layer.normalizedOrigin(), guide: full)
+        let fills = shaded(graded(regions), regions: regions)
+        return Layers(fills: fills, regions: regions)
     }
 
     /// Flat regions with borders where the real edges are. Shrinking and median filtering wipe out
@@ -129,14 +136,15 @@ enum SonnyBoyStyle {
         region = region
             .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: Knob.flattenBlur])
             .cropped(to: tinyExtent)
-        return upsample(region, guide: image)
+        return guidedUpsample(region, guide: image)
     }
 
-    private static func upsample(_ small: CIImage, guide: CIImage) -> CIImage {
+    /// Grows `small` to the size of `guide`, keeping its borders on the edges in `guide`.
+    static func guidedUpsample(_ small: CIImage, guide: CIImage) -> CIImage {
         let extent = guide.extent
         let parameters: [String: Any] = [
             kCIInputImageKey: guide,
-            "inputSmallImage": small,
+            "inputSmallImage": small.normalizedOrigin(),
             "inputSpatialSigma": Knob.upsampleSpatial,
             "inputLumaSigma": Knob.upsampleLuma
         ]
@@ -144,6 +152,28 @@ enum SonnyBoyStyle {
             return IllustrationStyle.upscaled(small, to: extent)
         }
         return output.cropped(to: extent)
+    }
+
+    /// `paletteSize` × 1 image of cel colors learned from `flat`. Seeded with last frame's palette,
+    /// so each color keeps its slot and can be eased instead of jumping.
+    static func paletteImage(from flat: CIImage, history: FrameHistory?) -> CIImage? {
+        let sample = IllustrationStyle.downscaled(flat, scale: Knob.paletteSampleScale)
+        let paletteExtent = CGRect(x: 0, y: 0, width: Knob.paletteSize, height: 1)
+        var parameters: [String: Any] = [
+            kCIInputImageKey: sample,
+            kCIInputExtentKey: CIVector(cgRect: sample.extent),
+            "inputCount": Knob.paletteSize,
+            "inputPasses": history == nil ? 5 : 2,
+            "inputPerceptual": true
+        ]
+        if let seed = history?.previous(matching: paletteExtent) {
+            parameters["inputMeans"] = seed
+        }
+        guard let means = CIFilter(name: "CIKMeans", parameters: parameters)?.outputImage else { return nil }
+        let box = means.extent.isInfinite || means.extent.isEmpty ? paletteExtent : means.extent
+        let colors = means.settingAlphaOne(in: box).cropped(to: box)
+        guard let history else { return colors }
+        return history.blend(colors, keep: Knob.paletteKeep)
     }
 
     private static func graded(_ image: CIImage) -> CIImage {
@@ -167,20 +197,18 @@ enum SonnyBoyStyle {
             .cropped(to: extent)
     }
 
-    /// Dark areas get one flat cool shadow tone with a hard edge, instead of photo shading.
-    private static func shaded(_ fills: CIImage, structure: CIImage) -> CIImage {
+    /// Dark regions get one flat cool shadow tone. The mask is cut from the palette regions with
+    /// no blur, so the shadow edge is exactly a region edge.
+    private static func shaded(_ fills: CIImage, regions: CIImage) -> CIImage {
         let extent = fills.extent
-        let luminance = structure.applyingFilter("CIColorControls", parameters: [
+        let luminance = regions.applyingFilter("CIColorControls", parameters: [
             kCIInputSaturationKey: 0,
             kCIInputBrightnessKey: 0,
             kCIInputContrastKey: 1
         ]).cropped(to: extent)
         let lit = luminance.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": Knob.shadowLevel])
             .cropped(to: extent)
-        let shadow = StableInk.opaque(StableInk.affine(lit, scale: -1, bias: 1))
-            .clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: Knob.shadowEdge])
-            .cropped(to: extent)
+        let shadow = StableInk.affine(lit, scale: -1, bias: 1)
         let tint = CIImage(color: Knob.shadowTint).cropped(to: extent)
         let dark = tint.applyingFilter("CIMultiplyBlendMode", parameters: [
             kCIInputBackgroundImageKey: fills

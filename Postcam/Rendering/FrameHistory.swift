@@ -54,7 +54,7 @@ final class FrameHistory {
         let source = image.normalizedOrigin()
         let newWidth = Int(source.extent.width.rounded(.down))
         let newHeight = Int(source.extent.height.rounded(.down))
-        guard newWidth > 1, newHeight > 1, newWidth < 8192, newHeight < 8192 else { return nil }
+        guard newWidth >= 1, newHeight >= 1, newWidth < 8192, newHeight < 8192 else { return nil }
         if newWidth != width || newHeight != height {
             buffers = []
             next = 0
