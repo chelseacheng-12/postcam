@@ -14,6 +14,7 @@ final class StampCompositor {
     private var cache: [String: (mask: CIImage, overlay: CIImage)] = [:]
     private var grain: CIImage?
     private var wobble: CIImage?
+    private var hatch: CIImage?
 
     init() {
         if let device = MTLCreateSystemDefaultDevice() {
@@ -33,7 +34,12 @@ final class StampCompositor {
             _ = self.grainImage()
             let extent = CGRect(x: 0, y: 0, width: 160, height: 160)
             let gray = CIImage(color: CIColor(red: 0.75, green: 0.62, blue: 0.58)).cropped(to: extent)
-            let styled = IllustrationStyle.apply(to: gray, grain: self.grainImage(), wobble: self.wobbleImage())
+            let styled = IllustrationStyle.apply(
+                to: gray,
+                grain: self.grainImage(),
+                wobble: self.wobbleImage(),
+                hatch: self.hatchImage()
+            )
             _ = self.context.createCGImage(styled, from: styled.extent)
         }
     }
@@ -49,6 +55,7 @@ final class StampCompositor {
             to: source,
             grain: grainImage(),
             wobble: wobbleImage(),
+            hatch: hatchImage(),
             history: history
         )
         let masked = stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
@@ -238,6 +245,59 @@ final class StampCompositor {
             kCIInputContrastKey: 1.8
         ]).cropped(to: rect)
         guard let cgImage = context.createCGImage(soft, from: rect) else { return fallback }
+        return CIImage(cgImage: cgImage)
+    }
+
+    private func hatchImage() -> CIImage {
+        cacheLock.lock()
+        if let hatch {
+            cacheLock.unlock()
+            return hatch
+        }
+        cacheLock.unlock()
+
+        let made = makeHatch()
+        cacheLock.lock()
+        if hatch == nil { hatch = made }
+        let result = hatch ?? made
+        cacheLock.unlock()
+        return result
+    }
+
+    /// Seamless tile of short, mostly vertical pencil strokes in varied grays on white.
+    /// Drawn once from a fixed seed; strokes that cross an edge are drawn again on the other side.
+    private func makeHatch() -> CIImage {
+        let side = 256
+        let size = CGFloat(side)
+        let rect = CGRect(x: 0, y: 0, width: size, height: size)
+        let fallback = CIImage(color: CIColor(red: 1, green: 1, blue: 1)).cropped(to: rect)
+        guard let canvas = bitmapContext(width: side, height: side) else { return fallback }
+        canvas.setFillColor(UIColor.white.cgColor)
+        canvas.fill(rect)
+        canvas.setLineCap(.round)
+
+        typealias Knob = IllustrationStyle.Knob
+        var random = SplitMix64(seed: Knob.hatchSeed)
+        let offsets: [CGFloat] = [-size, 0, size]
+        for _ in 0..<Knob.hatchStrokes {
+            let x = random.unit() * size
+            let y = random.unit() * size
+            let length = Knob.hatchMinLength + random.unit() * (Knob.hatchMaxLength - Knob.hatchMinLength)
+            let tilt = (random.unit() - 0.5) * 2 * Knob.hatchTilt
+            let dx = sin(tilt) * length
+            let dy = cos(tilt) * length
+            let tone = 0.2 + random.unit() * 0.6
+            canvas.setStrokeColor(UIColor(white: tone, alpha: 0.55).cgColor)
+            canvas.setLineWidth(1 + random.unit() * 1.6)
+            for ox in offsets {
+                for oy in offsets {
+                    canvas.move(to: CGPoint(x: x + ox, y: y + oy))
+                    canvas.addLine(to: CGPoint(x: x + ox + dx, y: y + oy + dy))
+                }
+            }
+            canvas.strokePath()
+        }
+        guard let cgImage = canvas.makeImage() else { return fallback }
         return CIImage(cgImage: cgImage)
     }
 }
