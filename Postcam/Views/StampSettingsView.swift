@@ -13,7 +13,7 @@ struct StampSettingsView: View {
                 Section {
                     proofView
                 } footer: {
-                    Text("The date is the month you shoot or upload. The other lines print in capitals.")
+                    Text("The date is the month you shoot or upload. The other lines print in capitals. Tap the stamp in the camera to change its size.")
                 }
 
                 Section("Stamp text") {

@@ -55,4 +55,8 @@ enum Haptic {
     static func select() {
         UISelectionFeedbackGenerator().selectionChanged()
     }
+
+    static func light() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
 }

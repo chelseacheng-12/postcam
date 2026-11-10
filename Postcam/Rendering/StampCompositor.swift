@@ -110,7 +110,8 @@ final class StampCompositor {
     }
 
     private func artwork(for extent: CGRect, copy: StampCopy) -> (mask: CIImage, overlay: CIImage)? {
-        let key = "\(Int(extent.width))x\(Int(extent.height))|\(copy.date)|\(copy.label)|\(copy.caption)|\(copy.denomination)|\(copy.place)"
+        let fractionKey = String(format: "%.4f", copy.widthFraction)
+        let key = "\(Int(extent.width))x\(Int(extent.height))|\(fractionKey)|\(copy.date)|\(copy.label)|\(copy.caption)|\(copy.denomination)|\(copy.place)"
         cacheLock.lock()
         if let hit = cache[key] {
             cacheLock.unlock()
@@ -131,7 +132,7 @@ final class StampCompositor {
     private func drawArtwork(extent: CGRect, copy: StampCopy) -> (mask: CIImage, overlay: CIImage)? {
         let width = Int(extent.width)
         let height = Int(extent.height)
-        let layout = StampGeometry.layout(in: extent)
+        let layout = StampGeometry.layout(in: extent, widthFraction: copy.widthFraction)
         guard layout.window.width > 16, layout.window.height > 16 else { return nil }
         guard let mask = drawMask(width: width, height: height, window: layout.window),
               let overlay = drawOverlay(width: width, height: height, layout: layout, copy: copy) else {
