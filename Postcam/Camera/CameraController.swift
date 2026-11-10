@@ -20,6 +20,10 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     }
 }
 
+private enum ModeKey {
+    static let captureMode = "postcam.capture.mode"
+}
+
 enum CameraError: LocalizedError {
     case noDevice
     case cannotAddInput
@@ -46,7 +50,7 @@ final class CameraController: NSObject, ObservableObject {
 
     @Published var authorization: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
     @Published var unavailableReason: String?
-    @Published var mode: CaptureMode = .photo
+    @Published var mode: CaptureMode
     @Published var isRecording = false
     @Published var recordingDuration: TimeInterval = 0
     @Published var lenses: [LensChoice] = [LensChoice(displayFactor: 1, deviceZoom: 1)]
@@ -110,6 +114,8 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     init(compositor: StampCompositor, settings: StampSettings) {
+        let storedMode = UserDefaults.standard.string(forKey: ModeKey.captureMode) ?? ""
+        mode = CaptureMode(rawValue: storedMode) ?? .photo
         self.compositor = compositor
         self.settings = settings
         frames = FramePublisher(context: compositor.context)
@@ -184,6 +190,7 @@ final class CameraController: NSObject, ObservableObject {
     func setMode(_ mode: CaptureMode) {
         guard !isRecording, self.mode != mode else { return }
         self.mode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: ModeKey.captureMode)
         if mode == .video, position == .front, flashEnabled {
             flashEnabled = false
         }
@@ -777,7 +784,7 @@ final class CameraController: NSObject, ObservableObject {
         readoutToken += 1
         let token = readoutToken
         isAdjustingZoom = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self, self.readoutToken == token else { return }
             self.isAdjustingZoom = false
         }
