@@ -197,7 +197,7 @@ final class StampSettings: ObservableObject {
     }
 
     private func tickAnimation(_ timer: Timer) {
-        let duration = 0.46
+        let duration = 0.25
         let elapsed = CFAbsoluteTimeGetCurrent() - animationStartTime
         if elapsed >= duration {
             setDisplayedFraction(animationEnd)
@@ -209,16 +209,21 @@ final class StampSettings: ObservableObject {
             return
         }
         let t = CGFloat(elapsed / duration)
-        let eased = springEase(min(max(t, 0), 1))
+        let eased = easeInOut(min(max(t, 0), 1))
         setDisplayedFraction(animationStart + (animationEnd - animationStart) * eased)
     }
 
-    /// Slight overshoot, settled at 1. t is 0...1.
-    private func springEase(_ t: CGFloat) -> CGFloat {
-        let time = Double(t)
-        let decay = exp(-4.4 * time)
-        let wobble = cos(8.5 * time)
-        return CGFloat(1 - decay * wobble)
+    /// Smooth ease-in-out. Stays inside 0...1, so the stamp does not bounce past the target size.
+    private func easeInOut(_ t: CGFloat) -> CGFloat {
+        let x = Double(min(max(t, 0), 1))
+        let eased: Double
+        if x < 0.5 {
+            eased = 4 * x * x * x
+        } else {
+            let p = -2 * x + 2
+            eased = 1 - (p * p * p) / 2
+        }
+        return CGFloat(eased)
     }
 
     private func setDisplayedFraction(_ value: CGFloat) {

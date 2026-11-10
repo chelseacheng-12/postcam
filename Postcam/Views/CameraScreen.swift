@@ -149,26 +149,52 @@ struct CameraScreen: View {
     }
 
     private var modeSelector: some View {
-        HStack(spacing: 22) {
+        HStack(spacing: 28) {
             modeButton(.video)
             modeButton(.photo)
         }
         .opacity(camera.isRecording ? 0.4 : 1)
         .allowsHitTesting(!camera.isRecording)
+        .simultaneousGesture(modeSwipe)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var modeSwipe: some Gesture {
+        DragGesture(minimumDistance: 18)
+            .onEnded { value in
+                guard !camera.isRecording else { return }
+                if value.translation.width <= -24 {
+                    selectMode(.photo)
+                    return
+                }
+                if value.translation.width >= 24 {
+                    selectMode(.video)
+                    return
+                }
+                return
+            }
     }
 
     private func modeButton(_ mode: CaptureMode) -> some View {
         Button {
-            Haptic.select()
-            camera.setMode(mode)
+            selectMode(mode)
         } label: {
             Text(mode.title)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(camera.mode == mode ? PostcamColor.cameraYellow : Color.white.opacity(0.86))
+                .foregroundStyle(camera.mode == mode ? PostcamColor.modePinkColor : Color.white.opacity(0.72))
                 .shadow(color: .black.opacity(0.45), radius: 2, y: 0)
+                .frame(minWidth: 64, minHeight: 32)
+                .animation(.easeInOut(duration: 0.2), value: camera.mode)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(mode.title)
         .accessibilityAddTraits(camera.mode == mode ? .isSelected : [])
+    }
+
+    private func selectMode(_ mode: CaptureMode) {
+        guard camera.mode != mode else { return }
+        Haptic.select()
+        camera.setMode(mode)
     }
 
     private var albumButton: some View {
