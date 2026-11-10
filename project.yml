@@ -7,6 +7,10 @@ options:
 settings:
   SWIFT_VERSION: "5.0"
   IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+  SDKROOT: iphoneos
+  SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+  SUPPORTS_MACCATALYST: NO
+  SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
   TARGETED_DEVICE_FAMILY: "1"
 targets:
   Postcam:
@@ -22,8 +26,11 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.chelseacheng.postcam
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Postcam/Info.plist
-        TARGETED_DEVICE_FAMILY: "1"
+        SDKROOT: iphoneos
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
         SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         VERSIONING_SYSTEM: apple-generic

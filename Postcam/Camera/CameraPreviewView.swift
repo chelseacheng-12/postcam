@@ -1,5 +1,6 @@
 import CoreImage
 import Metal
+import SwiftUI
 import UIKit
 
 protocol PreviewSurface: AnyObject {
