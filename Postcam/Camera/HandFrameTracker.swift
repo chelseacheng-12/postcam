@@ -8,32 +8,61 @@ import Vision
 final class HandFrameTracker {
     private let request: VNDetectHumanHandPoseRequest
     private let still: Bool
+    private let scene: SonnyBoyScene
     private var frameIndex = 0
     private var smoothed: [CGPoint] = []
     private var opacity: CGFloat = 0
     private var lastHit = CFAbsoluteTime(0)
     private var lastClock = CFAbsoluteTime(0)
+    /// Counts hand frames. Each new one picks a new surreal plan; it holds for that framing.
+    private var framing = 0
 
     /// `still` is for a single imported photo: a found frame is applied at full strength, with no fade.
-    init(still: Bool = false) {
+    init(context: CIContext, still: Bool = false) {
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = 2
         self.request = request
         self.still = still
+        let seed = still ? 0x5EED_C0DE : UInt64.random(in: 1...UInt64.max)
+        scene = SonnyBoyScene(context: context, still: still, seed: seed)
     }
 
     /// Sonny Boy inside the hand window. The rest of the frame stays the camera image.
-    func styled(_ image: CIImage) -> CIImage {
+    /// `forceFull` draws a window that is still fading at full strength, for photo capture.
+    func styled(_ image: CIImage, forceFull: Bool = false) -> CIImage {
         let source = image.normalizedOrigin()
-        guard let mask = mask(for: source) else { return source }
-        let stylized = SonnyBoyStyle.apply(to: source)
+        guard let mask = mask(for: source, forceFull: forceFull) else { return source }
+        let stylized = scene.render(source, horizon: windowHorizon(), framing: framing)
         return stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: source,
             kCIInputMaskImageKey: mask
         ]).cropped(to: source.extent)
     }
 
-    func mask(for image: CIImage) -> CIImage? {
+    /// Uploads. A hand frame in the photo limits the effect to its window, like the camera.
+    /// Without one, the whole photo gets the scene.
+    func styledStill(_ image: CIImage) -> CIImage {
+        let source = image.normalizedOrigin()
+        if let mask = mask(for: source, forceFull: true) {
+            let stylized = scene.render(source, horizon: windowHorizon(), framing: framing)
+            return stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputBackgroundImageKey: source,
+                kCIInputMaskImageKey: mask
+            ]).cropped(to: source.extent)
+        }
+        return scene.render(source, horizon: 0.45, framing: framing)
+    }
+
+    /// Upper part of the window may turn into sky, the lower part into ground.
+    private func windowHorizon() -> CGFloat {
+        guard smoothed.count == 4 else { return 0.45 }
+        let ys = smoothed.map { $0.y }
+        let low = ys.min() ?? 0
+        let high = ys.max() ?? 1
+        return low + (high - low) * 0.42
+    }
+
+    func mask(for image: CIImage, forceFull: Bool = false) -> CIImage? {
         let source = image.normalizedOrigin()
         let extent = source.extent
         guard extent.width > 2, extent.height > 2 else { return nil }
@@ -43,7 +72,7 @@ final class HandFrameTracker {
         }
         tickOpacity()
         guard opacity > 0.03, smoothed.count == 4 else { return nil }
-        return quadMask(smoothed, extent: extent, opacity: opacity)
+        return quadMask(smoothed, extent: extent, opacity: forceFull ? 1 : opacity)
     }
 
     private func detect(in image: CIImage) {
@@ -68,6 +97,9 @@ final class HandFrameTracker {
 
     private func adopt(_ quad: [CGPoint]) {
         lastHit = CFAbsoluteTimeGetCurrent()
+        if opacity == 0 {
+            framing += 1
+        }
         if smoothed.count == quad.count {
             let next = FramingPose.aligned(quad, to: smoothed)
             let eased = zip(smoothed, next).map { old, new in
