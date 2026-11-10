@@ -91,6 +91,17 @@ final class SonnyBoyScene {
         /// even when they have texture such as trees behind glass.
         static let glowLow: Double = 0.42
         static let glowHigh: Double = 0.66
+        /// Object mask. Edge energy above `busyLow` counts as a textured object unless it glows.
+        static let busyLow: Double = 0.34
+        static let busyGain: Double = 5
+        /// Saliency heat above this counts as an object unless it glows.
+        static let heatThreshold: Double = 0.55
+        /// Gap kept between sky or swapped ground and any object: working-size pixels before the
+        /// masks are grown, then full-resolution pixels after. Sky never cuts into a silhouette.
+        static let objectMargin: Double = 3
+        static let objectMarginFull: Double = 2
+        /// Share of a salient box that must be a detected object before it may float.
+        static let floatCoverage: CGFloat = 0.12
         /// Float lift as a share of frame height, and the bob around it.
         static let floatLift: CGFloat = 0.17
         static let floatBob: CGFloat = 0.012
@@ -104,12 +115,18 @@ final class SonnyBoyScene {
     private let sessionSeed: UInt64
     private let personRequest: VNGeneratePersonSegmentationRequest
     private let saliencyRequest = VNGenerateObjectnessBasedSaliencyImageRequest()
+    private let foregroundRequest = VNGenerateForegroundInstanceMaskRequest()
     private let cel: CelHistory?
+    private let palette: FrameHistory?
     private let regions: FrameHistory?
     private let lineHistory: FrameHistory?
     private let start = CFAbsoluteTimeGetCurrent()
 
     private var person: CIImage?
+    /// Foreground object instances (Vision, iOS 17), gray, at working size.
+    private var objects: CIImage?
+    /// Objectness saliency heat map, gray, at working size.
+    private var salientHeat: CIImage?
     private var floatBoxes: [CGRect] = []
     private var frameIndex = 0
     private var plan = SurrealPlan(upper: .sky, ground: .keep, floats: 1, whale: true, whalePhase: 0, textureSeed: 1)
@@ -125,6 +142,7 @@ final class SonnyBoyScene {
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
         personRequest = request
         cel = still ? nil : CelHistory(context: context)
+        palette = still ? nil : FrameHistory(context: context)
         regions = still ? nil : FrameHistory(context: context)
         lineHistory = still ? nil : FrameHistory(context: context)
     }
@@ -151,13 +169,16 @@ final class SonnyBoyScene {
         if still || person == nil || frameIndex % 3 == 0 {
             segmentPeople(small)
         }
-        if still || frameIndex % 30 == 1 || (floatBoxes.isEmpty && frameIndex % 6 == 1) {
+        if still || frameIndex % 8 == 4 || (objects == nil && frameIndex % 4 == 2) {
+            segmentObjects(small)
+        }
+        if still || frameIndex % 10 == 1 || (floatBoxes.isEmpty && frameIndex % 6 == 1) {
             findSalient(small)
         }
 
-        let layers = SonnyBoyStyle.cel(small, history: cel)
-        let base = SonnyBoyStyle.painted(layers.fills, full: full)
-        let lines = SonnyBoyStyle.lineMask(SonnyBoyStyle.painted(layers.structure, full: full), history: lineHistory)
+        let layers = SonnyBoyStyle.paint(full: full, small: small, history: cel, palette: palette)
+        let base = layers.fills
+        let lines = SonnyBoyStyle.lineMask(layers.regions, history: lineHistory)
         let windowRect = pixelRect(window, in: fullExtent)
         let level = min(max(horizon, 0.05), 0.95)
         let packed = regionMasks(small, horizonY: extent.minY + extent.height * level)
@@ -167,13 +188,15 @@ final class SonnyBoyScene {
         var ink = lines
         let time = CFAbsoluteTimeGetCurrent() - start
         if person != nil {
-            // Masks are smooth at working size; cutting them after the upscale gives sharp edges.
-            let masks = IllustrationStyle.upscaled(stable, to: fullExtent)
-            let sky = cut(grayChannel(masks, index: 0))
+            // Grown with the palette regions as the guide, then cut hard, so mask borders land on
+            // the same pixel-sharp borders as the fills instead of a stretched low-res blob.
+            let masks = SonnyBoyStyle.guidedUpsample(stable, guide: layers.regions)
+            let objectGuard = dilated(cut(grayChannel(masks, index: 2)), radius: Knob.objectMarginFull)
+            let free = StableInk.affine(objectGuard, scale: -1, bias: 1)
+            let sky = StableInk.multiply(cut(grayChannel(masks, index: 0)), free)
             let ground = plan.ground == .keep
                 ? CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: fullExtent)
-                : cut(grayChannel(masks, index: 1))
-            let people = cut(grayChannel(masks, index: 2))
+                : StableInk.multiply(cut(grayChannel(masks, index: 1)), free)
             let horizonY = fullExtent.minY + fullExtent.height * level
             let upper = upperLayer(fullExtent, window: windowRect, horizonY: horizonY, time: time)
             scene = upper.applyingFilter("CIBlendWithMask", parameters: [
@@ -189,13 +212,14 @@ final class SonnyBoyScene {
             }
             // Contours inside a swapped area belong to the old wall or floor, so they are dropped.
             let kept = StableInk.affine(brighter(sky, ground), scale: -1, bias: 1)
-            ink = brighter(StableInk.multiply(lines, kept), boundaries(sky: sky, ground: ground, people: people))
+            ink = brighter(StableInk.multiply(lines, kept), boundaries(sky: sky, ground: ground))
         }
         scene = SonnyBoyStyle.inked(scene, lines: ink)
 
-        if plan.floats > 0, !floatBoxes.isEmpty {
+        if plan.floats > 0, !floatBoxes.isEmpty, let objects {
+            let silhouettes = cut(SonnyBoyStyle.guidedUpsample(objects, guide: layers.regions))
             let object = SonnyBoyStyle.inked(base, lines: lines)
-            scene = floating(object, over: scene, boxes: floatBoxes, extent: fullExtent, time: time)
+            scene = floating(object, over: scene, boxes: floatBoxes, silhouettes: silhouettes, extent: fullExtent, time: time)
         }
         return scene
     }
@@ -208,10 +232,13 @@ final class SonnyBoyScene {
         plan = SurrealPlan.make(seed: mixed, groundIsWater: lowerBandLooksLikeWater(sample))
         textures = SonnyBoyTextures(seed: plan.textureSeed)
         cel?.reset()
+        palette?.reset()
         regions?.reset()
         lineHistory?.reset()
         floatBoxes = []
         person = nil
+        objects = nil
+        salientHeat = nil
     }
 
     private func lowerBandLooksLikeWater(_ image: CIImage) -> Bool {
@@ -230,11 +257,35 @@ final class SonnyBoyScene {
         } catch {
             return
         }
-        guard let buffer = personRequest.results?.first?.pixelBuffer else { return }
+        guard let buffer = personRequest.results?.first?.pixelBuffer,
+              let mask = scaledMask(buffer, extent: small.extent) else { return }
+        person = mask
+    }
+
+    /// Every foreground object Vision finds, as one gray mask. An empty scene gives black.
+    private func segmentObjects(_ small: CIImage) {
+        let handler = VNImageRequestHandler(ciImage: small, orientation: .up, options: [:])
+        do {
+            try handler.perform([foregroundRequest])
+        } catch {
+            return
+        }
+        guard let observation = foregroundRequest.results?.first else {
+            objects = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: small.extent)
+            return
+        }
+        guard let buffer = try? observation.generateScaledMaskForImage(
+            forInstances: observation.allInstances,
+            from: handler
+        ) else { return }
+        objects = scaledMask(buffer, extent: small.extent)
+    }
+
+    /// A one-channel Vision mask stretched over `extent` as an opaque gray image.
+    private func scaledMask(_ buffer: CVPixelBuffer, extent: CGRect) -> CIImage? {
         let raw = CIImage(cvPixelBuffer: buffer)
         let rawExtent = raw.extent
-        guard rawExtent.width > 1, rawExtent.height > 1 else { return }
-        let extent = small.extent
+        guard rawExtent.width > 1, rawExtent.height > 1 else { return nil }
         let scaled = raw
             .transformed(by: CGAffineTransform(
                 scaleX: extent.width / rawExtent.width,
@@ -242,7 +293,7 @@ final class SonnyBoyScene {
             ))
             .normalizedOrigin()
             .cropped(to: extent)
-        person = gray(fromRed: scaled)
+        return gray(fromRed: scaled)
     }
 
     private func findSalient(_ small: CIImage) {
@@ -252,14 +303,20 @@ final class SonnyBoyScene {
         } catch {
             return
         }
-        guard let objects = saliencyRequest.results?.first?.salientObjects else { return }
+        guard let observation = saliencyRequest.results?.first else { return }
         let extent = small.extent
+        if let heat = scaledMask(observation.pixelBuffer, extent: extent) {
+            salientHeat = heat
+        }
+        guard let found = observation.salientObjects else { return }
         var candidates: [(box: CGRect, score: CGFloat)] = []
-        for object in objects {
+        for object in found {
             let box = object.boundingBox
             let area = box.width * box.height
             guard area > 0.01, area < 0.28 else { continue }
             if let person, personCoverage(person, box: box, extent: extent) > 0.35 { continue }
+            // Only things Vision segmented as objects float, never a patch of wall.
+            guard let objects, personCoverage(objects, box: box, extent: extent) > Knob.floatCoverage else { continue }
             let score = CGFloat(object.confidence) * (1 - abs(area - 0.08) * 2)
             if score > 0 {
                 candidates.append((box, score))
@@ -340,12 +397,15 @@ final class SonnyBoyScene {
 
     // MARK: - Regions
 
-    /// Packs three gray masks into one opaque image: red = sky, green = ground, blue = person.
+    /// Packs three gray masks into one opaque image: red = sky, green = ground, blue = objects
+    /// (people included). Sky and ground already stay clear of objects by `objectMargin`.
     /// One buffer, so one temporal blend keeps all three steady.
     private func regionMasks(_ small: CIImage, horizonY: CGFloat) -> CIImage {
         let extent = small.extent
         let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: extent)
         let personMask = person ?? black
+        let instances = objects ?? black
+        let heat = salientHeat ?? black
 
         let luminance = small.applyingFilter("CIColorControls", parameters: [
             kCIInputSaturationKey: 0,
@@ -384,14 +444,30 @@ final class SonnyBoyScene {
         )
 
         let skyLike = brighter(StableInk.multiply(flatUp, bright), glow)
-        let skyRaw = StableInk.multiply(StableInk.multiply(above, skyLike), notPerson)
-        let groundRaw = StableInk.multiply(StableInk.multiply(below, flatDown), notPerson)
+
+        // Anything that is an object: people, Vision's foreground instances, salient spots, and
+        // busy texture. Bright glowing areas (windows) are not objects unless Vision segmented them.
+        let notGlow = StableInk.affine(glow, scale: -1, bias: 1)
+        let busy = StableInk.affine(energy, scale: Knob.busyGain, bias: -Knob.busyLow * Knob.busyGain)
+        let hot = StableInk.affine(heat, scale: 4, bias: -Knob.heatThreshold * 4)
+        let objectsAll = brighter(
+            brighter(personMask, instances),
+            StableInk.multiply(brighter(busy, hot), notGlow)
+        )
+        let objectGuard = objectsAll.clampedToExtent()
+            .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: Knob.objectMargin])
+            .cropped(to: extent)
+        let free = StableInk.multiply(StableInk.affine(objectGuard, scale: -1, bias: 1), notPerson)
+
+        let skyRaw = StableInk.multiply(StableInk.multiply(above, skyLike), free)
+        let groundRaw = StableInk.multiply(StableInk.multiply(below, flatDown), free)
         let sky = shaped(skyRaw, threshold: Knob.skyThreshold)
         let ground = shaped(groundRaw, threshold: Knob.groundThreshold)
+        let foreground = shaped(objectsAll, threshold: 0.5)
 
         let red = channel(sky, index: 0)
         let green = channel(ground, index: 1)
-        let blue = channel(personMask, index: 2)
+        let blue = channel(foreground, index: 2)
         // Maximum, not addition: each channel is zero in the other two images and alpha stays 1.
         return red
             .applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: green])
@@ -534,23 +610,37 @@ final class SonnyBoyScene {
         }
     }
 
-    /// Thin lines where sky, ground, and people meet, so the swap reads as one drawing.
+    /// Thin lines where sky and ground meet everything else, so the swap reads as one drawing.
     /// Traced on the sharp full-resolution masks, so the line is as thin as the image lines.
-    private func boundaries(sky: CIImage, ground: CIImage, people: CIImage) -> CIImage {
+    /// The sky's edge runs around every object in front of it, which outlines those objects too.
+    private func boundaries(sky: CIImage, ground: CIImage) -> CIImage {
         let extent = sky.extent
         let radius = SonnyBoyStyle.Knob.boundaryRadius
-        let rings = brighter(
-            brighter(StableInk.outline(sky, radius: radius), StableInk.outline(ground, radius: radius)),
-            StableInk.outline(people, radius: radius)
-        )
+        let rings = brighter(StableInk.outline(sky, radius: radius), StableInk.outline(ground, radius: radius))
         return StableInk.opaque(
             rings.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": 0.5]).cropped(to: extent)
         )
     }
 
+    /// Grows a hard gray mask by `radius` pixels.
+    private func dilated(_ mask: CIImage, radius: Double) -> CIImage {
+        let extent = mask.extent
+        return mask.clampedToExtent()
+            .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: radius])
+            .cropped(to: extent)
+    }
+
     /// Copies salient objects and lifts them into the air, bobbing slowly, each with a soft shadow
     /// on the spot it rose from. With one object and two floats, a smaller second copy rides beside it.
-    private func floating(_ base: CIImage, over scene: CIImage, boxes: [CGRect], extent: CGRect, time: CFTimeInterval) -> CIImage {
+    /// Each copy is cut along the object's own silhouette, so its edge is as sharp as the drawing.
+    private func floating(
+        _ base: CIImage,
+        over scene: CIImage,
+        boxes: [CGRect],
+        silhouettes: CIImage,
+        extent: CGRect,
+        time: CFTimeInterval
+    ) -> CIImage {
         var copies: [(rect: CGRect, scale: CGFloat, dx: CGFloat, lift: CGFloat)] = []
         for index in 0..<plan.floats {
             let box = boxes.count > index ? boxes[index] : boxes[0]
@@ -583,7 +673,7 @@ final class SonnyBoyScene {
             result = shadow.composited(over: result).cropped(to: extent)
         }
         for copy in copies {
-            guard let patch = cutout(base, rect: copy.rect, extent: extent) else { continue }
+            let patch = cutout(base, silhouettes: silhouettes, rect: copy.rect, extent: extent)
             let rect = copy.rect
             let transform = CGAffineTransform(translationX: -rect.midX, y: -rect.midY)
                 .concatenating(CGAffineTransform(scaleX: copy.scale, y: copy.scale))
@@ -593,23 +683,14 @@ final class SonnyBoyScene {
         return result
     }
 
-    /// The object inside `rect` with a soft rounded edge and transparency around it.
-    private func cutout(_ base: CIImage, rect: CGRect, extent: CGRect) -> CIImage? {
-        let parameters: [String: Any] = [
-            "inputExtent": CIVector(cgRect: rect.insetBy(dx: rect.width * 0.08, dy: rect.height * 0.08)),
-            "inputRadius": min(rect.width, rect.height) * 0.2,
-            "inputColor": CIColor(red: 1, green: 1, blue: 1)
-        ]
-        guard let shape = CIFilter(name: "CIRoundedRectangleGenerator", parameters: parameters)?.outputImage else {
-            return nil
-        }
-        let feather = shape.cropped(to: extent)
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 3 / Knob.workScale])
-            .cropped(to: extent)
+    /// The object pixels inside `rect`, transparent everywhere else. Hard-edged.
+    private func cutout(_ base: CIImage, silhouettes: CIImage, rect: CGRect, extent: CGRect) -> CIImage {
+        let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: extent)
+        let mask = silhouettes.cropped(to: rect).composited(over: black).cropped(to: extent)
         let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: extent)
-        return base.applyingFilter("CIBlendWithAlphaMask", parameters: [
+        return base.applyingFilter("CIBlendWithMask", parameters: [
             kCIInputBackgroundImageKey: clear,
-            kCIInputMaskImageKey: feather
+            kCIInputMaskImageKey: mask
         ]).cropped(to: rect)
     }
 }

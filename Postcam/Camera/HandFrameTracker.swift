@@ -3,9 +3,17 @@ import CoreImage
 import Foundation
 import Vision
 
-/// Finds the two-hand director's frame and returns a soft mask of the window inside it.
+/// Finds the two-hand director's frame and returns a hard-edged mask of the window inside it.
 /// Vision runs on every other frame. The quad is smoothed, held while at least one hand stays in
 /// view, and fades out when the hands leave.
+///
+/// Hands held right at the lens often show only a thumb and an index finger, and Vision may miss
+/// them. Detection tries, in order:
+/// 1. Two L-shaped hands (strong; switches the window on at once).
+/// 2. Partial hands: one L, or two lone fingers, with the frame edges as the missing sides.
+/// 3. The same on a zoomed-out copy of the frame, where big close-up hands fit the detector better.
+/// 4. Skin-colored fingers bracketing an empty rectangle from at least three sides.
+/// Steps 2–4 must agree for a few detections in a row before the window switches on.
 final class HandFrameTracker {
     enum Knob {
         /// Run hand pose on every Nth camera frame.
@@ -22,9 +30,19 @@ final class HandFrameTracker {
         static let holdWithNoHands: CFTimeInterval = 0.2
         /// Fade-out speed, opacity per second.
         static let fadePerSecond: CGFloat = 2.6
+        /// Detections in a row a partial hand frame (one L, two fingers) needs before it shows.
+        static let partialConfirm = 2
+        /// Detections in a row the skin-color fallback needs before it shows.
+        static let skinConfirm = 3
+        static let skinFallback = true
+        /// The zoomed-out Vision pass shrinks the frame to this share inside a gray border.
+        static let zoomOut: CGFloat = 0.62
+        /// Width of the grid the skin fallback works on.
+        static let skinGridWidth = 72
     }
 
     private let request: VNDetectHumanHandPoseRequest
+    private let context: CIContext
     private let still: Bool
     private let scene: SonnyBoyScene
     private var frameIndex = 0
@@ -35,12 +53,17 @@ final class HandFrameTracker {
     private var lastClock = CFAbsoluteTime(0)
     /// Counts hand frames. Each new one picks a new surreal plan; it holds for that framing.
     private var framing = 0
+    private var detections = 0
+    /// Weak detections in a row.
+    private var weakStreak = 0
+    private var lastPair = CFAbsoluteTime(0)
 
     /// `still` is for a single imported photo: a found frame is applied at full strength, with no fade.
     init(context: CIContext, still: Bool = false) {
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = Knob.maximumHands
         self.request = request
+        self.context = context
         self.still = still
         let seed = still ? 0x5EED_C0DE : UInt64.random(in: 1...UInt64.max)
         scene = SonnyBoyScene(context: context, still: still, seed: seed)
@@ -113,19 +136,114 @@ final class HandFrameTracker {
         let small = image
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .normalizedOrigin()
-        let handler = VNImageRequestHandler(ciImage: small, orientation: .up, options: [:])
+        let aspect = image.extent.width / max(image.extent.height, 1)
+        detections += 1
+
+        let hands = handPoints(in: small, zoom: 1)
+        if !hands.isEmpty {
+            lastHandSeen = CFAbsoluteTimeGetCurrent()
+        }
+        var found = FramingPose.detect(hands, aspect: aspect)
+        if let found, found.kind == .pair {
+            accept(found)
+            return
+        }
+
+        // Fallbacks cost a second Vision pass. While no window is up they run every other time.
+        let runFallbacks = still || opacity > 0 || detections % 2 == 0
+        if runFallbacks {
+            let zoomed = handPoints(in: small, zoom: Knob.zoomOut)
+            if !zoomed.isEmpty {
+                lastHandSeen = CFAbsoluteTimeGetCurrent()
+            }
+            if let combined = FramingPose.detect(hands + zoomed, aspect: aspect),
+               combined.kind == .pair || found == nil {
+                found = combined
+            }
+        }
+        if let found {
+            accept(found)
+            return
+        }
+        if runFallbacks, Knob.skinFallback, !still, let quad = skinWindow(small) {
+            lastHandSeen = CFAbsoluteTimeGetCurrent()
+            accept(FramingPose.Detection(quad: quad, kind: .skin))
+            return
+        }
+        if runFallbacks {
+            weakStreak = 0
+        }
+    }
+
+    private func accept(_ detection: FramingPose.Detection) {
+        switch detection.kind {
+        case .pair:
+            weakStreak = 0
+            lastPair = CFAbsoluteTimeGetCurrent()
+            adopt(detection.quad)
+        case .partial, .skin:
+            weakStreak += 1
+            // A two-hand frame seen a moment ago is better; a partial one would only make the
+            // window jump. It still counts as hands in view, which keeps the hold going.
+            if CFAbsoluteTimeGetCurrent() - lastPair < Knob.holdWithNoHands * 2.5 {
+                lastHit = CFAbsoluteTimeGetCurrent()
+                return
+            }
+            let needed = detection.kind == .skin ? Knob.skinConfirm : Knob.partialConfirm
+            if still || opacity > 0 || weakStreak >= needed {
+                adopt(detection.quad)
+            }
+        }
+    }
+
+    /// Hand joints from Vision in normalized y-up frame coordinates. With `zoom` below 1 the frame
+    /// is shrunk into the middle of a gray canvas first, and points are mapped back.
+    private func handPoints(in small: CIImage, zoom: CGFloat) -> [HandPoints] {
+        let extent = small.extent
+        var input = small
+        let offset = (1 - zoom) / 2
+        if zoom < 1 {
+            let gray = CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5)).cropped(to: extent)
+            input = small
+                .transformed(by: CGAffineTransform(scaleX: zoom, y: zoom))
+                .transformed(by: CGAffineTransform(translationX: extent.width * offset, y: extent.height * offset))
+                .composited(over: gray)
+                .cropped(to: extent)
+        }
+        let handler = VNImageRequestHandler(ciImage: input, orientation: .up, options: [:])
         do {
             try handler.perform([request])
         } catch {
-            return
+            return []
         }
-        let aspect = image.extent.width / max(image.extent.height, 1)
         let observations = request.results ?? []
-        if !observations.isEmpty {
-            lastHandSeen = CFAbsoluteTimeGetCurrent()
+        return observations.map { observation in
+            HandPoints(observation) { point in
+                CGPoint(x: (point.x - offset) / zoom, y: (point.y - offset) / zoom)
+            }
         }
-        guard let quad = FramingPose.quad(from: observations, aspect: aspect) else { return }
-        adopt(quad)
+    }
+
+    /// Skin-color fallback for when Vision sees no hand at all.
+    private func skinWindow(_ small: CIImage) -> [CGPoint]? {
+        let extent = small.extent
+        guard extent.width > 4, extent.height > 4 else { return nil }
+        let width = Knob.skinGridWidth
+        let height = max(8, Int((CGFloat(width) * extent.height / extent.width).rounded()))
+        let grid = small
+            .transformed(by: CGAffineTransform(scaleX: CGFloat(width) / extent.width, y: CGFloat(height) / extent.height))
+            .normalizedOrigin()
+            .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        context.render(
+            grid,
+            toBitmap: &pixels,
+            rowBytes: width * 4,
+            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
+        return SkinFrame.window(rgba: pixels, width: width, height: height)
     }
 
     private func adopt(_ quad: [CGPoint]) {
@@ -182,10 +300,9 @@ final class HandFrameTracker {
             "inputTopLeft": CIVector(cgPoint: corners[3])
         ])
         let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: extent)
-        let radius = max(4, extent.width * 0.012)
+        // No blur: the illustrated window meets the photo on a crisp, antialiased edge.
         return quad.cropped(to: extent)
             .composited(over: clear)
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
             .cropped(to: extent)
     }
 }
@@ -199,6 +316,28 @@ enum FramingPose {
         var indexTip: CGPoint
         var thumbTip: CGPoint
         var crotch: CGPoint
+    }
+
+    struct Detection {
+        enum Kind {
+            /// Two L's closing a frame.
+            case pair
+            /// One L or two lone fingers, with frame edges as the missing sides.
+            case partial
+            /// Skin-color fallback.
+            case skin
+        }
+
+        var quad: [CGPoint]
+        var kind: Kind
+    }
+
+    /// One finger as a segment from a lower joint to its tip, in aspect-scaled space.
+    struct Finger {
+        var tip: CGPoint
+        var base: CGPoint
+        /// The base is the knuckle where the finger meets the hand, not a joint partway up.
+        var rooted: Bool
     }
 
     /// Returns four normalized, y-up corners ordered counterclockwise, or nil.
@@ -216,12 +355,61 @@ enum FramingPose {
         static let inset: CGFloat = 0.95
         /// Smallest window, as a share of the frame. There is no largest; big windows are clamped.
         static let minimumArea: CGFloat = 0.004
+        /// Partial frames (one L, two fingers) need a bigger window and a squarer angle, so a hand
+        /// waved past the lens does not count.
+        static let partialMinimumArea: CGFloat = 0.06
+        static let partialMinimumAngle: CGFloat = 50
+        static let partialMaximumAngle: CGFloat = 130
+        static let partialFingerLength: CGFloat = 0.04
+        /// Each arm of a partial L, from its corner to the fingertip. Close-up fingers are long.
+        static let partialArm: CGFloat = 0.1
+        /// Two lone fingers this close to parallel (degrees) bound a band; this far apart (share
+        /// of the frame) at least.
+        static let parallelAngle: CGFloat = 30
+        static let parallelGap: CGFloat = 0.12
+    }
+
+    /// Best window from all hands: a pair of L's first, then one L, then two lone fingers.
+    static func detect(_ hands: [HandPoints], aspect: CGFloat) -> Detection? {
+        let scaleX = max(aspect, 0.05)
+        let ls = hands.map { handL(from: $0, scaleX: scaleX) }
+        let found = ls.compactMap { $0 }
+        if let quad = pairQuad(found, scaleX: scaleX) {
+            return Detection(quad: quad, kind: .pair)
+        }
+
+        var best: [CGPoint]?
+        var bestArea: CGFloat = 0
+        func consider(_ square: [CGPoint]?) {
+            guard let square else { return }
+            let window = clampedToFrame(square.map { CGPoint(x: $0.x / scaleX, y: $0.y) })
+            let size = area(window)
+            guard isConvexCounterClockwise(window), size > Knob.partialMinimumArea, size > bestArea else { return }
+            best = window
+            bestArea = size
+        }
+        for hand in found {
+            consider(openL(corner: hand.crotch, toward: hand.indexTip, and: hand.thumbTip, scaleX: scaleX))
+        }
+        // Lone fingers come from hands that did not make an L.
+        var lone: [(hand: Int, finger: Finger)] = []
+        for (index, hand) in hands.enumerated() where ls[index] == nil {
+            if let finger = finger(index: true, hand, scaleX: scaleX) { lone.append((index, finger)) }
+            if let finger = finger(index: false, hand, scaleX: scaleX) { lone.append((index, finger)) }
+        }
+        if lone.count >= 2 {
+            for first in 0..<(lone.count - 1) {
+                for second in (first + 1)..<lone.count where lone[first].hand != lone[second].hand {
+                    consider(fingerQuad(lone[first].finger, lone[second].finger, scaleX: scaleX))
+                }
+            }
+        }
+        guard let best else { return nil }
+        return Detection(quad: best, kind: .partial)
     }
 
     /// Every pair of L-shaped hands is tried; the largest window wins.
-    static func quad(from observations: [VNHumanHandPoseObservation], aspect: CGFloat) -> [CGPoint]? {
-        let scaleX = max(aspect, 0.05)
-        let hands = observations.compactMap { handL(from: $0, scaleX: scaleX) }
+    private static func pairQuad(_ hands: [HandL], scaleX: CGFloat) -> [CGPoint]? {
         guard hands.count >= 2 else { return nil }
         var best: [CGPoint]?
         var bestArea: CGFloat = 0
@@ -238,6 +426,90 @@ enum FramingPose {
             }
         }
         return best
+    }
+
+    /// An L whose corner is `corner` and whose arms point at `a` and `b`, run out to the frame edges.
+    /// The fourth corner completes the parallelogram.
+    private static func openL(corner: CGPoint, toward a: CGPoint, and b: CGPoint, scaleX: CGFloat) -> [CGPoint]? {
+        let u = CGPoint(x: a.x - corner.x, y: a.y - corner.y)
+        let v = CGPoint(x: b.x - corner.x, y: b.y - corner.y)
+        guard hypot(u.x, u.y) > Knob.partialArm, hypot(v.x, v.y) > Knob.partialArm else { return nil }
+        let degrees = angleDegrees(u, v)
+        guard degrees > Knob.partialMinimumAngle, degrees < Knob.partialMaximumAngle else { return nil }
+        guard let p1 = exitPoint(from: corner, direction: u, width: scaleX),
+              let p2 = exitPoint(from: corner, direction: v, width: scaleX) else { return nil }
+        let p3 = CGPoint(x: p1.x + p2.x - corner.x, y: p1.y + p2.y - corner.y)
+        return orderAroundCenter([corner, p1, p3, p2])
+    }
+
+    /// Two fingers from different hands. Near-parallel fingers bound a band across the frame;
+    /// crossing fingers make an L at the point where their lines meet.
+    private static func fingerQuad(_ a: Finger, _ b: Finger, scaleX: CGFloat) -> [CGPoint]? {
+        let da = CGPoint(x: a.tip.x - a.base.x, y: a.tip.y - a.base.y)
+        let db = CGPoint(x: b.tip.x - b.base.x, y: b.tip.y - b.base.y)
+        guard hypot(da.x, da.y) > Knob.partialFingerLength, hypot(db.x, db.y) > Knob.partialFingerLength else {
+            return nil
+        }
+        var degrees = angleDegrees(da, db)
+        if degrees > 90 { degrees = 180 - degrees }
+        if degrees < Knob.parallelAngle {
+            let mid = midpoint(b.tip, b.base)
+            guard distanceToLine(mid, through: a.base, direction: da) > Knob.parallelGap,
+                  let (a0, a1) = clipLine(through: a.base, direction: da, width: scaleX),
+                  let (b0, b1) = clipLine(through: b.base, direction: db, width: scaleX) else { return nil }
+            return orderAroundCenter([a0, a1, b0, b1])
+        }
+        guard let meet = intersection(a.base, da, b.base, db),
+              meet.x > -0.3, meet.x < scaleX + 0.3, meet.y > -0.3, meet.y < 1.3 else { return nil }
+        let towardA = distance(meet, a.tip) > distance(meet, a.base) ? a.tip : a.base
+        let towardB = distance(meet, b.tip) > distance(meet, b.base) ? b.tip : b.base
+        return openL(corner: meet, toward: towardA, and: towardB, scaleX: scaleX)
+    }
+
+    /// Where a ray from `point` leaves the frame (`width` × 1, aspect-scaled).
+    private static func exitPoint(from point: CGPoint, direction: CGPoint, width: CGFloat) -> CGPoint? {
+        var t = CGFloat.greatestFiniteMagnitude
+        if direction.x > 0.0001 { t = min(t, (width - point.x) / direction.x) }
+        if direction.x < -0.0001 { t = min(t, -point.x / direction.x) }
+        if direction.y > 0.0001 { t = min(t, (1 - point.y) / direction.y) }
+        if direction.y < -0.0001 { t = min(t, -point.y / direction.y) }
+        guard t.isFinite, t > 0, t < 1000 else { return nil }
+        return CGPoint(x: point.x + direction.x * t, y: point.y + direction.y * t)
+    }
+
+    /// The two points where a line crosses the frame border, or nil if it misses the frame.
+    private static func clipLine(through point: CGPoint, direction: CGPoint, width: CGFloat) -> (CGPoint, CGPoint)? {
+        var low = -CGFloat.greatestFiniteMagnitude
+        var high = CGFloat.greatestFiniteMagnitude
+        let axes: [(CGFloat, CGFloat, CGFloat)] = [(point.x, direction.x, width), (point.y, direction.y, 1)]
+        for (origin, step, size) in axes {
+            if abs(step) < 0.0001 {
+                if origin < 0 || origin > size { return nil }
+                continue
+            }
+            let t0 = -origin / step
+            let t1 = (size - origin) / step
+            low = max(low, min(t0, t1))
+            high = min(high, max(t0, t1))
+        }
+        guard low < high, low.isFinite, high.isFinite else { return nil }
+        return (
+            CGPoint(x: point.x + direction.x * low, y: point.y + direction.y * low),
+            CGPoint(x: point.x + direction.x * high, y: point.y + direction.y * high)
+        )
+    }
+
+    private static func intersection(_ p: CGPoint, _ r: CGPoint, _ q: CGPoint, _ s: CGPoint) -> CGPoint? {
+        let denominator = r.x * s.y - r.y * s.x
+        guard abs(denominator) > 0.0001 else { return nil }
+        let t = ((q.x - p.x) * s.y - (q.y - p.y) * s.x) / denominator
+        return CGPoint(x: p.x + r.x * t, y: p.y + r.y * t)
+    }
+
+    private static func distanceToLine(_ point: CGPoint, through origin: CGPoint, direction: CGPoint) -> CGFloat {
+        let length = hypot(direction.x, direction.y)
+        guard length > 0.0001 else { return distance(point, origin) }
+        return abs((point.x - origin.x) * direction.y - (point.y - origin.y) * direction.x) / length
     }
 
     /// Keeps corners on the picture, so a frame held right at the lens covers the screen instead of
@@ -282,35 +554,72 @@ enum FramingPose {
         return true
     }
 
-    private static func handL(from observation: VNHumanHandPoseObservation, scaleX: CGFloat) -> HandL? {
-        // A fingertip cut off by the frame edge falls back to the next joint down the finger.
-        let tip = Knob.tipConfidence
-        let base = Knob.baseConfidence
-        let indexTipPoint = joint(.indexTip, observation, minimum: tip)
-            ?? joint(.indexDIP, observation, minimum: tip)
-        let thumbTipPoint = joint(.thumbTip, observation, minimum: tip)
-            ?? joint(.thumbIP, observation, minimum: tip)
-        let indexBasePoint = joint(.indexMCP, observation, minimum: base)
-            ?? joint(.indexPIP, observation, minimum: base)
-        let thumbBasePoint = joint(.thumbMP, observation, minimum: base)
-            ?? joint(.thumbCMC, observation, minimum: base)
-        guard let indexTipPoint, let thumbTipPoint, let indexBasePoint, let thumbBasePoint else { return nil }
-
-        let indexTip = CGPoint(x: indexTipPoint.x * scaleX, y: indexTipPoint.y)
-        let thumbTip = CGPoint(x: thumbTipPoint.x * scaleX, y: thumbTipPoint.y)
-        let indexMCP = CGPoint(x: indexBasePoint.x * scaleX, y: indexBasePoint.y)
-        let thumbMCP = CGPoint(x: thumbBasePoint.x * scaleX, y: thumbBasePoint.y)
-
-        let indexLength = distance(indexTip, indexMCP)
-        let thumbLength = distance(thumbTip, thumbMCP)
-        let opening = distance(indexTip, thumbTip)
+    /// A thumb and index finger at an L angle. Either finger may be partial: a fingertip cut off by
+    /// the frame falls back to the next joint, and a missing knuckle to a joint further up. When the
+    /// knuckles are out of view, the corner of the L is where the two finger lines meet.
+    private static func handL(from hand: HandPoints, scaleX: CGFloat) -> HandL? {
+        guard let index = finger(index: true, hand, scaleX: scaleX),
+              let thumb = finger(index: false, hand, scaleX: scaleX) else { return nil }
+        let indexLength = distance(index.tip, index.base)
+        let thumbLength = distance(thumb.tip, thumb.base)
+        let opening = distance(index.tip, thumb.tip)
         guard indexLength > 0.01, thumbLength > 0.008, opening > 0.015 else { return nil }
-        let indexDirection = CGPoint(x: indexTip.x - indexMCP.x, y: indexTip.y - indexMCP.y)
-        let thumbDirection = CGPoint(x: thumbTip.x - thumbMCP.x, y: thumbTip.y - thumbMCP.y)
+        let indexDirection = CGPoint(x: index.tip.x - index.base.x, y: index.tip.y - index.base.y)
+        let thumbDirection = CGPoint(x: thumb.tip.x - thumb.base.x, y: thumb.tip.y - thumb.base.y)
         let degrees = angleDegrees(indexDirection, thumbDirection)
         // About a right angle, with a wide allowance for perspective and a loose L.
         guard degrees > Knob.minimumAngle, degrees < Knob.maximumAngle else { return nil }
-        return HandL(indexTip: indexTip, thumbTip: thumbTip, crotch: midpoint(indexMCP, thumbMCP))
+
+        var crotch = midpoint(index.base, thumb.base)
+        if !(index.rooted && thumb.rooted),
+           let meet = intersection(index.base, indexDirection, thumb.base, thumbDirection),
+           distance(meet, index.base) < 0.5, distance(meet, thumb.base) < 0.5 {
+            crotch = meet
+        }
+        return HandL(indexTip: index.tip, thumbTip: thumb.tip, crotch: crotch)
+    }
+
+    /// Index (`index` true) or thumb as a segment, from the best joints available.
+    private static func finger(index: Bool, _ hand: HandPoints, scaleX: CGFloat) -> Finger? {
+        let tip = Knob.tipConfidence
+        let base = Knob.baseConfidence
+        let tipNames: [VNHumanHandPoseObservation.JointName] = index ? [.indexTip, .indexDIP] : [.thumbTip, .thumbIP]
+        let rootNames: [VNHumanHandPoseObservation.JointName] = index ? [.indexMCP] : [.thumbMP, .thumbCMC]
+        let midNames: [VNHumanHandPoseObservation.JointName] = index ? [.indexPIP, .indexDIP] : [.thumbIP]
+
+        var tipName: VNHumanHandPoseObservation.JointName?
+        var tipPoint: CGPoint?
+        for name in tipNames {
+            if let point = hand.point(name, minimum: tip) {
+                tipName = name
+                tipPoint = point
+                break
+            }
+        }
+        guard let tipPoint, let tipName else { return nil }
+        var basePoint: CGPoint?
+        var rooted = false
+        for name in rootNames {
+            if let point = hand.point(name, minimum: base) {
+                basePoint = point
+                rooted = true
+                break
+            }
+        }
+        if basePoint == nil {
+            for name in midNames where name != tipName {
+                if let point = hand.point(name, minimum: base) {
+                    basePoint = point
+                    break
+                }
+            }
+        }
+        guard let basePoint, distance(basePoint, tipPoint) > 0.005 else { return nil }
+        return Finger(
+            tip: CGPoint(x: tipPoint.x * scaleX, y: tipPoint.y),
+            base: CGPoint(x: basePoint.x * scaleX, y: basePoint.y),
+            rooted: rooted
+        )
     }
 
     /// Corners are the two L crotches (between thumb MCP and index MCP) and the two places
@@ -388,17 +697,6 @@ enum FramingPose {
         CGPoint(x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5)
     }
 
-    private static func joint(
-        _ name: VNHumanHandPoseObservation.JointName,
-        _ observation: VNHumanHandPoseObservation,
-        minimum: Float
-    ) -> CGPoint? {
-        guard let point = try? observation.recognizedPoint(name), point.confidence >= minimum else {
-            return nil
-        }
-        return point.location
-    }
-
     private static func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
         hypot(a.x - b.x, a.y - b.y)
     }
@@ -409,5 +707,164 @@ enum FramingPose {
         guard magnitude > 0.0001 else { return 0 }
         let cosine = min(1, max(-1, dot / magnitude))
         return acos(cosine) * 180 / .pi
+    }
+}
+
+/// The thumb and index joints of one Vision hand, in normalized y-up frame coordinates.
+struct HandPoints {
+    static let names: [VNHumanHandPoseObservation.JointName] = [
+        .thumbTip, .thumbIP, .thumbMP, .thumbCMC,
+        .indexTip, .indexDIP, .indexPIP, .indexMCP
+    ]
+
+    private var joints: [VNHumanHandPoseObservation.JointName: (location: CGPoint, confidence: Float)] = [:]
+
+    /// `map` moves Vision's points into frame coordinates, for passes run on a reworked image.
+    init(_ observation: VNHumanHandPoseObservation, map: (CGPoint) -> CGPoint) {
+        for name in HandPoints.names {
+            guard let point = try? observation.recognizedPoint(name), point.confidence > 0 else { continue }
+            joints[name] = (map(point.location), point.confidence)
+        }
+    }
+
+    func point(_ name: VNHumanHandPoseObservation.JointName, minimum: Float) -> CGPoint? {
+        guard let joint = joints[name], joint.confidence >= minimum else { return nil }
+        return joint.location
+    }
+}
+
+/// Fallback for hands Vision cannot see: skin-colored fingers bracketing an empty rectangle.
+/// Works on a small RGBA grid whose first row is the top of the picture.
+enum SkinFrame {
+    enum Knob {
+        /// Share of skin a strip just outside a side needs for that side to count as a finger.
+        static let sideSkin: CGFloat = 0.45
+        /// Sides that must be fingers. Three keeps a hand in one corner from counting.
+        static let minimumSides = 3
+        static let minimumArea: CGFloat = 0.06
+        static let maximumArea: CGFloat = 0.85
+        /// Share of the picture that may be skin. Outside this, it is a face, a wall, or no hand.
+        static let minimumSkin: CGFloat = 0.03
+        static let maximumSkin: CGFloat = 0.6
+    }
+
+    /// Four normalized y-up corners, counterclockwise from bottom-left, or nil.
+    static func window(rgba: [UInt8], width: Int, height: Int) -> [CGPoint]? {
+        guard width > 4, height > 4, rgba.count >= width * height * 4 else { return nil }
+        var skin = [Bool](repeating: false, count: width * height)
+        var skinCount = 0
+        for index in 0..<(width * height) {
+            let r = CGFloat(rgba[index * 4])
+            let g = CGFloat(rgba[index * 4 + 1])
+            let b = CGFloat(rgba[index * 4 + 2])
+            let y = 0.299 * r + 0.587 * g + 0.114 * b
+            let cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
+            let cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
+            if y > 45, cr > 135, cr < 180, cb > 80, cb < 132 {
+                skin[index] = true
+                skinCount += 1
+            }
+        }
+        let fraction = CGFloat(skinCount) / CGFloat(width * height)
+        guard fraction > Knob.minimumSkin, fraction < Knob.maximumSkin else { return nil }
+        skin = closed(skin, width: width, height: height)
+        guard touchesBorder(skin, width: width, height: height) else { return nil }
+
+        var integral = [Int](repeating: 0, count: (width + 1) * (height + 1))
+        for row in 0..<height {
+            var sum = 0
+            for column in 0..<width {
+                sum += skin[row * width + column] ? 1 : 0
+                integral[(row + 1) * (width + 1) + column + 1] = integral[row * (width + 1) + column + 1] + sum
+            }
+        }
+        func skinIn(top: Int, left: Int, bottom: Int, right: Int) -> CGFloat {
+            let t = max(0, top), l = max(0, left), b = min(height - 1, bottom), r = min(width - 1, right)
+            guard t <= b, l <= r else { return 0 }
+            let total = integral[(b + 1) * (width + 1) + r + 1] - integral[t * (width + 1) + r + 1]
+                - integral[(b + 1) * (width + 1) + l] + integral[t * (width + 1) + l]
+            return CGFloat(total) / CGFloat((b - t + 1) * (r - l + 1))
+        }
+
+        var best: (top: Int, left: Int, bottom: Int, right: Int)?
+        var bestScore: CGFloat = 0
+        func evaluate(top: Int, left: Int, bottom: Int, right: Int) {
+            let area = CGFloat((bottom - top + 1) * (right - left + 1)) / CGFloat(width * height)
+            guard area > Knob.minimumArea, area < Knob.maximumArea else { return }
+            let thickV = max(2, height / 30)
+            let thickH = max(2, width / 30)
+            var sides = 0
+            if top > 0, skinIn(top: top - thickV, left: left, bottom: top - 1, right: right) > Knob.sideSkin { sides += 1 }
+            if bottom < height - 1, skinIn(top: bottom + 1, left: left, bottom: bottom + thickV, right: right) > Knob.sideSkin { sides += 1 }
+            if left > 0, skinIn(top: top, left: left - thickH, bottom: bottom, right: left - 1) > Knob.sideSkin { sides += 1 }
+            if right < width - 1, skinIn(top: top, left: right + 1, bottom: bottom, right: right + thickH) > Knob.sideSkin { sides += 1 }
+            guard sides >= Knob.minimumSides else { return }
+            let score = area * CGFloat(sides)
+            if score > bestScore {
+                bestScore = score
+                best = (top, left, bottom, right)
+            }
+        }
+
+        // Every maximal skin-free rectangle, found row by row with a histogram stack.
+        var heights = [Int](repeating: 0, count: width)
+        for row in 0..<height {
+            for column in 0..<width {
+                heights[column] = skin[row * width + column] ? 0 : heights[column] + 1
+            }
+            var stack: [Int] = []
+            for column in 0...width {
+                let current = column < width ? heights[column] : 0
+                while let last = stack.last, heights[last] >= current {
+                    stack.removeLast()
+                    let barHeight = heights[last]
+                    guard barHeight > 0 else { continue }
+                    let left = (stack.last ?? -1) + 1
+                    evaluate(top: row - barHeight + 1, left: left, bottom: row, right: column - 1)
+                }
+                stack.append(column)
+            }
+        }
+
+        guard let best else { return nil }
+        let minX = CGFloat(best.left) / CGFloat(width)
+        let maxX = CGFloat(best.right + 1) / CGFloat(width)
+        let maxY = 1 - CGFloat(best.top) / CGFloat(height)
+        let minY = 1 - CGFloat(best.bottom + 1) / CGFloat(height)
+        return [
+            CGPoint(x: minX, y: minY),
+            CGPoint(x: maxX, y: minY),
+            CGPoint(x: maxX, y: maxY),
+            CGPoint(x: minX, y: maxY)
+        ]
+    }
+
+    /// Dilate then erode by one cell, so a finger with a dark crease stays one strip.
+    private static func closed(_ mask: [Bool], width: Int, height: Int) -> [Bool] {
+        func pass(_ input: [Bool], grow: Bool) -> [Bool] {
+            var output = input
+            for row in 0..<height {
+                for column in 0..<width {
+                    var value = !grow
+                    for dy in -1...1 {
+                        for dx in -1...1 {
+                            let y = min(max(row + dy, 0), height - 1)
+                            let x = min(max(column + dx, 0), width - 1)
+                            if grow { value = value || input[y * width + x] } else { value = value && input[y * width + x] }
+                        }
+                    }
+                    output[row * width + column] = value
+                }
+            }
+            return output
+        }
+        return pass(pass(mask, grow: true), grow: false)
+    }
+
+    /// Hands come in from the edges of the picture.
+    private static func touchesBorder(_ mask: [Bool], width: Int, height: Int) -> Bool {
+        for column in 0..<width where mask[column] || mask[(height - 1) * width + column] { return true }
+        for row in 0..<height where mask[row * width] || mask[row * width + width - 1] { return true }
+        return false
     }
 }
