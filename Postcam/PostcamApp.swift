@@ -92,11 +92,13 @@ final class AppModel: ObservableObject {
         isImporting = true
         settings.refreshDate()
         let copy = settings.copyForCurrentFrame()
+        let style = camera.artStyle
         DispatchQueue.global(qos: .userInitiated).async { [compositor, weak self] in
             let output: UIImage? = {
                 guard let image = UIImage(data: data),
                       let source = ImagePrep.ciImage(from: image, maxPixel: 2800) else { return nil }
-                return compositor.uiImage(from: compositor.composite(source, copy: copy))
+                let styled = Self.renderImport(source, style: style, copy: copy, compositor: compositor)
+                return compositor.uiImage(from: styled)
             }()
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -107,6 +109,20 @@ final class AppModel: ObservableObject {
                 }
                 self.savePhoto(output)
             }
+        }
+    }
+
+    private static func renderImport(
+        _ source: CIImage,
+        style: ArtStyle,
+        copy: StampCopy,
+        compositor: StampCompositor
+    ) -> CIImage {
+        switch style {
+        case .postcard:
+            return compositor.composite(source, copy: copy)
+        case .sonnyBoy:
+            return HandFrameTracker().styled(source)
         }
     }
 

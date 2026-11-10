@@ -1,11 +1,10 @@
 import CoreGraphics
 import CoreImage
-import CoreText
 import Metal
 import UIKit
 
-/// Bakes the perforated frame, typewriter lines, and the anime treatment inside the window.
-/// Mask and text are cached until the pixel size or the stamp copy changes.
+/// Bakes the perforated frame and the anime treatment inside the window.
+/// The paper and the mask are cached until the pixel size or the stamp width changes.
 final class StampCompositor {
     let metalDevice: MTLDevice?
     let context: CIContext
@@ -112,7 +111,7 @@ final class StampCompositor {
 
     private func artwork(for extent: CGRect, copy: StampCopy) -> (mask: CIImage, overlay: CIImage)? {
         let fractionKey = String(format: "%.4f", copy.widthFraction)
-        let key = "\(Int(extent.width))x\(Int(extent.height))|\(fractionKey)|\(copy.date)|\(copy.label)|\(copy.caption)|\(copy.denomination)|\(copy.place)"
+        let key = "\(Int(extent.width))x\(Int(extent.height))|\(fractionKey)"
         cacheLock.lock()
         if let hit = cache[key] {
             cacheLock.unlock()
@@ -136,7 +135,7 @@ final class StampCompositor {
         let layout = StampGeometry.layout(in: extent, widthFraction: copy.widthFraction)
         guard layout.window.width > 16, layout.window.height > 16 else { return nil }
         guard let mask = drawMask(width: width, height: height, window: layout.window),
-              let overlay = drawOverlay(width: width, height: height, layout: layout, copy: copy) else {
+              let overlay = drawOverlay(width: width, height: height, layout: layout) else {
             return nil
         }
         return (mask, overlay)
@@ -152,7 +151,7 @@ final class StampCompositor {
         return upright(cgImage)
     }
 
-    private func drawOverlay(width: Int, height: Int, layout: StampLayout, copy: StampCopy) -> CIImage? {
+    private func drawOverlay(width: Int, height: Int, layout: StampLayout) -> CIImage? {
         guard let context = bitmapContext(width: width, height: height) else { return nil }
         let canvas = CGRect(x: 0, y: 0, width: width, height: height)
         context.clear(canvas)
@@ -171,7 +170,6 @@ final class StampCompositor {
         context.setLineWidth(max(1, layout.bounds.width * 0.0035))
         context.strokePath()
 
-        drawCopy(copy, layout: layout, in: context)
         guard let cgImage = context.makeImage() else { return nil }
         return upright(cgImage)
     }
@@ -193,133 +191,6 @@ final class StampCompositor {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         )
-    }
-
-    private func drawCopy(_ copy: StampCopy, layout: StampLayout, in context: CGContext) {
-        let window = layout.window
-        let padX = window.width * 0.055
-        let padY = window.height * 0.05
-        let dateFont = typewriter(size: window.width * 0.042, bold: false)
-        let labelFont = typewriter(size: window.width * 0.037, bold: false)
-        let captionFont = typewriter(size: window.width * 0.030, bold: false)
-        let valueFont = typewriter(size: window.width * 0.074, bold: true)
-        let placeFont = typewriter(size: window.width * 0.033, bold: false)
-
-        let capTop = window.maxY - padY
-        let textBottom = window.minY + padY
-        let placeBaseline = textBottom - placeFont.descender
-        let captionBaseline = textBottom - captionFont.descender
-        let valueBaseline = placeBaseline + placeFont.lineHeight * 0.78
-
-        drawLine(
-            copy.date,
-            baselineY: capTop - dateFont.ascender,
-            anchorX: window.minX + padX,
-            align: .left,
-            maxWidth: window.width * 0.46,
-            font: dateFont,
-            color: PostcamColor.inkUI,
-            in: context
-        )
-        drawLine(
-            copy.label,
-            baselineY: capTop - labelFont.ascender,
-            anchorX: window.maxX - padX,
-            align: .right,
-            maxWidth: window.width * 0.48,
-            font: labelFont,
-            color: PostcamColor.inkUI,
-            in: context
-        )
-        drawLine(
-            copy.caption,
-            baselineY: captionBaseline,
-            anchorX: window.minX + padX,
-            align: .left,
-            maxWidth: window.width * 0.56,
-            font: captionFont,
-            color: PostcamColor.inkUI,
-            in: context
-        )
-        drawLine(
-            copy.denomination,
-            baselineY: valueBaseline,
-            anchorX: window.maxX - padX,
-            align: .right,
-            maxWidth: window.width * 0.34,
-            font: valueFont,
-            color: PostcamColor.vermilionUI,
-            in: context
-        )
-        drawLine(
-            copy.place,
-            baselineY: placeBaseline,
-            anchorX: window.maxX - padX,
-            align: .right,
-            maxWidth: window.width * 0.36,
-            font: placeFont,
-            color: PostcamColor.inkUI,
-            in: context
-        )
-    }
-
-    private enum TextAlign { case left, right }
-
-    private func drawLine(
-        _ text: String,
-        baselineY: CGFloat,
-        anchorX: CGFloat,
-        align: TextAlign,
-        maxWidth: CGFloat,
-        font: UIFont,
-        color: UIColor,
-        in context: CGContext
-    ) {
-        let rendered = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard !rendered.isEmpty else { return }
-
-        var current = font
-        var inkLine = makeLine(rendered, font: current, color: color)
-        var width = CGFloat(CTLineGetTypographicBounds(inkLine, nil, nil, nil))
-        while width > maxWidth && current.pointSize > 8 {
-            current = current.withSize(current.pointSize - 0.5)
-            inkLine = makeLine(rendered, font: current, color: color)
-            width = CGFloat(CTLineGetTypographicBounds(inkLine, nil, nil, nil))
-        }
-
-        let originX: CGFloat
-        switch align {
-        case .left: originX = anchorX
-        case .right: originX = anchorX - width
-        }
-
-        let halo = makeLine(rendered, font: current, color: PostcamColor.haloUI)
-        let radius = max(1, current.pointSize * 0.06)
-        let shifts = [
-            CGPoint(x: -radius, y: 0), CGPoint(x: radius, y: 0),
-            CGPoint(x: 0, y: -radius), CGPoint(x: 0, y: radius)
-        ]
-        for shift in shifts {
-            context.textPosition = CGPoint(x: originX + shift.x, y: baselineY + shift.y)
-            CTLineDraw(halo, context)
-        }
-        context.textPosition = CGPoint(x: originX, y: baselineY)
-        CTLineDraw(inkLine, context)
-    }
-
-    private func makeLine(_ text: String, font: UIFont, color: UIColor) -> CTLine {
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: color.cgColor,
-            .kern: font.pointSize * 0.04
-        ]
-        return CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
-    }
-
-    private func typewriter(size: CGFloat, bold: Bool) -> UIFont {
-        let name = bold ? "AmericanTypewriter-Bold" : "AmericanTypewriter-Condensed"
-        return UIFont(name: name, size: size)
-            ?? UIFont.monospacedSystemFont(ofSize: size, weight: bold ? .bold : .regular)
     }
 
     private func grainImage() -> CIImage {
