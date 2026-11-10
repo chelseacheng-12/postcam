@@ -105,7 +105,6 @@ final class CameraController: NSObject, ObservableObject {
     private var capturePhotoOnNextFrame = false
     private var turnTorchOffAfterPhoto = false
     private var recordingThumbnail: UIImage?
-    private var didLogFrame = false
 
     private var lastFramePosition: AVCaptureDevice.Position?
     private let handTracker: HandFrameTracker
@@ -412,6 +411,15 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func configure(position: AVCaptureDevice.Position) throws {
+        try configureSession(position: position)
+        // Swapping the input replaces the video connection when the configuration commits, and the
+        // new connection starts with no rotation and no mirroring. Settings applied inside the
+        // configuration block can land on the connection that is about to go away, so apply them
+        // again once the commit is done.
+        applyConnectionSettings(for: position)
+    }
+
+    private func configureSession(position: AVCaptureDevice.Position) throws {
         guard let device = makeDevice(position: position) else { throw CameraError.noDevice }
         let input = try AVCaptureDeviceInput(device: device)
 
@@ -445,13 +453,12 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         addAudioOutputIfNeeded()
-        let mirrored = configureConnection(for: position)
+        applyConnectionSettings(for: position)
         let displayZoom = configureDevice(device)
 
         videoDevice = device
         stateLock.lock()
         shared.position = position
-        shared.mirrorApplied = mirrored
         stateLock.unlock()
 
         let lenses = zoomMap.lenses
@@ -476,19 +483,25 @@ final class CameraController: NSObject, ObservableObject {
         audioAdded = true
     }
 
-    private func configureConnection(for position: AVCaptureDevice.Position) -> Bool {
-        guard let connection = videoOutput.connection(with: .video) else { return false }
+    /// Same for both cameras: portrait rotation on the connection, and the front camera mirrored
+    /// like a mirror. Each frame then reads the state of the connection it came from, so a frame
+    /// that slips through before these settings land is still drawn upright.
+    private func applyConnectionSettings(for position: AVCaptureDevice.Position) {
+        guard let connection = videoOutput.connection(with: .video) else {
+            let name = String(describing: position)
+            logger.info("No video connection yet for \(name, privacy: .public)")
+            return
+        }
         if connection.isVideoRotationAngleSupported(Self.portraitRotation) {
             connection.videoRotationAngle = Self.portraitRotation
         }
-        var mirrored = false
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            let shouldMirror = position == .front
-            connection.isVideoMirrored = shouldMirror
-            mirrored = shouldMirror
+            connection.isVideoMirrored = position == .front
         }
-        return mirrored
+        let angle = Double(connection.videoRotationAngle)
+        let mirrored = connection.isVideoMirrored
+        logger.info("Connection angle \(angle) mirrored \(mirrored)")
     }
 
     @discardableResult
@@ -674,21 +687,25 @@ final class CameraController: NSObject, ObservableObject {
 
     // MARK: - Frames
 
-    private func handleVideo(_ sampleBuffer: CMSampleBuffer) {
+    private func handleVideo(_ sampleBuffer: CMSampleBuffer, connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let snapshot = currentShared()
 
-        let front = snapshot.position == .front
+        let portPosition = connection.inputPorts.first?.sourceDevicePosition ?? .unspecified
+        let front = (portPosition == .unspecified ? snapshot.position : portPosition) == .front
+        let mirrored = connection.isVideoMirrored
         var image = CIImage(cvPixelBuffer: pixelBuffer)
+        // Normal case for both cameras: the connection already rotated to portrait (and mirrored the
+        // front camera), so the buffer is used as is.
+        // Fallback when a buffer is still landscape: an unmirrored sensor buffer needs a quarter turn
+        // clockwise (.right) for either camera. A landscape buffer the connection already mirrored
+        // left to right would come out of that turn upside down, so it takes the counterclockwise
+        // turn (.left) instead. Both end up the same as the portrait case.
         if image.extent.width > image.extent.height + 1 {
-            image = image.oriented(front ? .left : .right)
-        } else if front && snapshot.mirrorApplied {
-            // With the portrait rotation and mirroring both on the connection, front-camera frames
-            // arrive turned 180°. A half turn gives the upright mirrored selfie view.
-            image = image.oriented(.down)
+            image = image.oriented(mirrored ? .left : .right)
         }
-        if front && !snapshot.mirrorApplied {
+        if front && !mirrored {
             image = image.oriented(.upMirrored)
         }
         image = image.normalizedOrigin().croppedToEvenAspect(snapshot.previewAspect)
@@ -696,11 +713,11 @@ final class CameraController: NSObject, ObservableObject {
         if lastFramePosition != snapshot.position {
             lastFramePosition = snapshot.position
             postcardHistory.reset()
-        }
-
-        if !didLogFrame {
-            didLogFrame = true
-            logger.info("Frame \(Int(image.extent.width))x\(Int(image.extent.height))")
+            let rawWidth = CVPixelBufferGetWidth(pixelBuffer)
+            let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
+            let side = front ? "front" : "back"
+            let angle = Double(connection.videoRotationAngle)
+            logger.info("\(side, privacy: .public) buffer \(rawWidth)x\(rawHeight) angle \(angle) mirrored \(mirrored)")
         }
         if !snapshot.hasFrame {
             stateLock.lock()
@@ -785,7 +802,6 @@ final class CameraController: NSObject, ObservableObject {
 
     private struct Shared {
         var position: AVCaptureDevice.Position = .back
-        var mirrorApplied = false
         var previewAspect: CGFloat = 9.0 / 19.5
         var wantsRunning = false
         var wideZoom: CGFloat = 1
@@ -919,7 +935,7 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapt
         if output === audioOutput {
             handleAudio(sampleBuffer)
         } else {
-            handleVideo(sampleBuffer)
+            handleVideo(sampleBuffer, connection: connection)
         }
     }
 }
