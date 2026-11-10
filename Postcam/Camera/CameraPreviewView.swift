@@ -105,6 +105,7 @@ final class CameraPreviewView: UIView, PreviewSurface {
         hideReticle?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.fadeReticle()
+            return
         }
         hideReticle = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)

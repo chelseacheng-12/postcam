@@ -142,8 +142,12 @@ private struct VideoPage: View {
             } else {
                 player?.pause()
             }
+            return
         }
-        .onDisappear { player?.pause() }
+        .onDisappear {
+            player?.pause()
+            return
+        }
     }
 
     private func prepare() {

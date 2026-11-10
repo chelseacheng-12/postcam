@@ -228,6 +228,7 @@ final class CameraController: NSObject, ObservableObject {
         shutterBlink = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             self?.shutterBlink = false
+            return
         }
 
         let useScreen = flashEnabled && position == .front
@@ -235,6 +236,7 @@ final class CameraController: NSObject, ObservableObject {
             screenFlash = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
                 self?.screenFlash = false
+                return
             }
         }
 
@@ -313,7 +315,9 @@ final class CameraController: NSObject, ObservableObject {
                 self?.sessionQueue.async {
                     self?.micAuthorized = granted
                     self?.configureIfNeededAndStart()
+                    return
                 }
+                return
             }
         case .authorized:
             sessionQueue.async {
@@ -465,6 +469,7 @@ final class CameraController: NSObject, ObservableObject {
         zoomObservation?.invalidate()
         zoomObservation = device.observe(\.videoZoomFactor, options: [.new]) { [weak self] device, _ in
             self?.publishDisplayZoom(device.videoZoomFactor)
+            return
         }
         return map.display(for: oneX)
     }
@@ -642,8 +647,9 @@ final class CameraController: NSObject, ObservableObject {
         let stamped = compositor.composite(image, copy: settings.copyForCurrentFrame())
         guard let buffer = frames.render(stamped) else { return }
 
-        let recycle = { [weak self] (buffer: CVPixelBuffer) in
+        let recycle: (CVPixelBuffer) -> Void = { [weak self] buffer in
             self?.frames.recycle(buffer)
+            return
         }
 
         if recorder.isAccepting {
@@ -658,7 +664,10 @@ final class CameraController: NSObject, ObservableObject {
             let restoreTorch = turnTorchOffAfterPhoto
             turnTorchOffAfterPhoto = false
             if let photo = compositor.uiImage(from: CIImage(cvPixelBuffer: buffer)) {
-                DispatchQueue.main.async { self.onPhoto?(photo) }
+                DispatchQueue.main.async {
+                    self.onPhoto?(photo)
+                    return
+                }
             }
             if restoreTorch {
                 sessionQueue.async { self.setTorch(false) }
@@ -760,7 +769,10 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func report(_ text: String) {
-        DispatchQueue.main.async { self.onStatus?(text) }
+        DispatchQueue.main.async {
+            self.onStatus?(text)
+            return
+        }
     }
 
     private func installObservers() {
@@ -783,7 +795,11 @@ final class CameraController: NSObject, ObservableObject {
             object: session,
             queue: .main
         ) { [weak self] _ in
-            self?.sessionQueue.async { self?.configureIfNeededAndStart() }
+            self?.sessionQueue.async {
+                self?.configureIfNeededAndStart()
+                return
+            }
+            return
         })
         observers.append(center.addObserver(
             forName: UIApplication.willResignActiveNotification,
@@ -791,6 +807,7 @@ final class CameraController: NSObject, ObservableObject {
             queue: .main
         ) { [weak self] _ in
             self?.stop()
+            return
         })
         observers.append(center.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
@@ -798,6 +815,7 @@ final class CameraController: NSObject, ObservableObject {
             queue: .main
         ) { [weak self] _ in
             self?.start()
+            return
         })
     }
 }
