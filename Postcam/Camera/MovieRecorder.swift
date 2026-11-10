@@ -66,7 +66,8 @@ final class MovieRecorder {
         lock.unlock()
     }
 
-    func appendVideo(_ buffer: CVPixelBuffer, at time: CMTime) {
+    /// `mirrored` flips the frame left to right on the way into the file.
+    func appendVideo(_ buffer: CVPixelBuffer, at time: CMTime, mirrored: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         guard accepting, !failed else { return }
@@ -78,7 +79,11 @@ final class MovieRecorder {
               let adaptor else { return }
 
         guard let destination = makePixelBuffer() else { return }
-        let image = CIImage(cvPixelBuffer: buffer).cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+        var image = CIImage(cvPixelBuffer: buffer)
+        if mirrored {
+            image = image.oriented(.upMirrored).normalizedOrigin()
+        }
+        image = image.cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
         context.render(
             image,
             to: destination,
