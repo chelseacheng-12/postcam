@@ -51,7 +51,7 @@ final class HandFrameTracker {
     func styled(_ image: CIImage, forceFull: Bool = false) -> CIImage {
         let source = image.normalizedOrigin()
         guard let mask = mask(for: source, forceFull: forceFull) else { return source }
-        let stylized = scene.render(source, horizon: windowHorizon(), framing: framing)
+        let stylized = scene.render(source, horizon: windowHorizon(), framing: framing, window: windowBounds())
         return stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: source,
             kCIInputMaskImageKey: mask
@@ -63,7 +63,7 @@ final class HandFrameTracker {
     func styledStill(_ image: CIImage) -> CIImage {
         let source = image.normalizedOrigin()
         if let mask = mask(for: source, forceFull: true) {
-            let stylized = scene.render(source, horizon: windowHorizon(), framing: framing)
+            let stylized = scene.render(source, horizon: windowHorizon(), framing: framing, window: windowBounds())
             return stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
                 kCIInputBackgroundImageKey: source,
                 kCIInputMaskImageKey: mask
@@ -79,6 +79,19 @@ final class HandFrameTracker {
         let low = ys.min() ?? 0
         let high = ys.max() ?? 1
         return low + (high - low) * 0.42
+    }
+
+    /// Bounding box of the window, 0...1 and y-up, so the sky art is sized to it.
+    private func windowBounds() -> CGRect {
+        guard smoothed.count == 4 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        let xs = smoothed.map { $0.x }
+        let ys = smoothed.map { $0.y }
+        let minX = max(0, xs.min() ?? 0)
+        let minY = max(0, ys.min() ?? 0)
+        let maxX = min(1, xs.max() ?? 1)
+        let maxY = min(1, ys.max() ?? 1)
+        guard maxX > minX, maxY > minY else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
     func mask(for image: CIImage, forceFull: Bool = false) -> CIImage? {

@@ -2,28 +2,53 @@ import CoreGraphics
 import CoreImage
 import Foundation
 
-/// Flat 2D cel look from Sonny Boy: bold clean color, almost no shading, thin dark outlines.
-/// `cel` makes the flat fills at working resolution. `lineMask` traces the outlines at full
-/// resolution, so they stay thin and sharp instead of being scaled up with the fills.
+/// Flat 2D painted look from Sonny Boy: smooth cel color with soft gradients, hard cool shadows,
+/// and thin dark outlines. `cel` makes the fills at working resolution: the frame is shrunk,
+/// median-filtered until photo texture is gone, then grown back with an edge-preserving upsample
+/// guided by the frame, so regions are flat but their borders follow the real edges.
+/// `painted` grows that to full resolution the same way. `lineMask` traces outlines on the
+/// flattened image at full resolution, so they stay thin and skip texture.
 /// `SonnyBoyScene` swaps skies and ground around them.
 enum SonnyBoyStyle {
     enum Knob {
-        static let posterizeLevels: Double = 5
-        /// Almost flat. A little remains so a face is not a single chip of color.
-        static let gradientKeep: Double = 0.1
-        static let saturation: Double = 1.38
-        static let brightness: Double = 0.04
-        static let contrast: Double = 1.12
+        /// Flattening: the frame is shrunk to this share of working size and median-filtered
+        /// `flattenPasses` times. Smaller and more passes is flatter and more painted.
+        static let flattenScale: CGFloat = 0.32
+        static let flattenPasses = 3
+        static let flattenBlur: Double = 0.8
+        /// Edge-preserving upsample. `upsampleLuma` is how different two sides of an edge must be
+        /// to stay separate; lower keeps more detail, higher paints over more of it.
+        static let upsampleSpatial: Double = 3
+        static let upsampleLuma: Double = 0.14
+        /// 0 or 1 turns posterizing off. Above 1 adds hard color steps on top of the smooth fills.
+        static let posterizeLevels: Double = 0
+        static let gradientKeep: Double = 0.35
+
+        /// Bright, clean, high-key grade.
+        static let exposure: Double = 0.3
+        static let vibrance: Double = 0.35
+        static let saturation: Double = 1.18
+        static let brightness: Double = 0.02
+        static let contrast: Double = 1.04
+        /// Slight cool cast in the light colors, like a painted background.
+        static let coolLift: CGFloat = 0.03
+
+        /// Hard cel shadows: anything darker than `shadowLevel` (linear luminance of the
+        /// flattened image) is multiplied by `shadowTint`, with a hard edge.
+        static let shadowLevel: Double = 0.075
+        static let shadowEdge: Double = 0.6
+        static let shadowTint = CIColor(red: 0.66, green: 0.72, blue: 0.92)
+
         static let colorKeep: CGFloat = 0.65
         static let fillKeep: CGFloat = 0.5
 
-        /// Outlines, traced on the full-resolution frame. A 3×3 median removes sensor noise without
-        /// moving edges; `lineBlur` is only a light pre-smooth. Higher `lineThreshold` keeps fewer,
-        /// stronger contours. `lineHysteresis` keeps last frame's lines with less edge strength,
+        /// Outlines, traced at full resolution on the flattened image, so only borders between
+        /// painted regions get a line. `lineBlur` is only a light pre-smooth. Higher `lineThreshold`
+        /// keeps fewer, stronger contours. `lineHysteresis` keeps last frame's lines with less edge strength,
         /// which is what holds them still while panning; nothing is blended or blurred over time.
         static let lineBlur: Double = 0.8
         static let lineIntensity: Double = 3.0
-        static let lineThreshold: Double = 0.4
+        static let lineThreshold: Double = 0.42
         static let lineHysteresis: Double = 0.16
         /// Blur on the finished line. 0 is a hard, crisp edge.
         static let lineSoften: Double = 0
@@ -35,10 +60,9 @@ enum SonnyBoyStyle {
         /// Near-black ink with a cool cast, like the show's outlines.
         static let ink = CIColor(red: 0.10, green: 0.10, blue: 0.14)
 
-        static let skyTop = CIColor(red: 0.04, green: 0.24, blue: 0.74)
-        static let skyLow = CIColor(red: 0.16, green: 0.46, blue: 0.93)
-        static let cloud = CIColor(red: 1, green: 1, blue: 1)
-        static let cloudShade = CIColor(red: 0.80, green: 0.87, blue: 0.97)
+        /// Saturated cobalt, deepest at the top of the window.
+        static let skyTop = CIColor(red: 0.05, green: 0.27, blue: 0.80)
+        static let skyLow = CIColor(red: 0.30, green: 0.58, blue: 0.96)
         static let blank = CIColor(red: 0.97, green: 0.96, blue: 0.92)
         static let seaFar = CIColor(red: 0.05, green: 0.42, blue: 0.68)
         static let seaNear = CIColor(red: 0.10, green: 0.62, blue: 0.74)
@@ -55,30 +79,116 @@ enum SonnyBoyStyle {
         )
     }
 
-    /// Flat fills, no lines. `small` is already at working resolution with its origin at zero.
-    static func cel(_ small: CIImage, history: CelHistory?) -> CIImage {
+    /// Fills at working resolution, plus the flattened image before grading and shadows.
+    /// Outlines are traced on `structure`, so they follow region borders, not photo texture.
+    struct Layers {
+        let fills: CIImage
+        let structure: CIImage
+    }
+
+    /// `small` is already at working resolution with its origin at zero.
+    static func cel(_ small: CIImage, history: CelHistory?) -> Layers {
         let extent = small.extent
-        var smoothed = IllustrationStyle.smoothedColor(small)
+        let guide = IllustrationStyle.smoothedColor(small)
+        var structure = flattened(guide)
         if let history {
-            smoothed = history.color.blend(smoothed, keep: Knob.colorKeep)
+            structure = history.color.blend(structure, keep: Knob.colorKeep)
         }
 
-        let flat = smoothed.applyingFilter("CIColorPosterize", parameters: [
-            "inputLevels": Knob.posterizeLevels
-        ]).cropped(to: extent)
-        let mixed = flat.applyingFilter("CIDissolveTransition", parameters: [
-            kCIInputTargetImageKey: smoothed,
-            kCIInputTimeKey: Knob.gradientKeep
-        ]).cropped(to: extent)
-        var fills = mixed.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: Knob.saturation,
-            kCIInputBrightnessKey: Knob.brightness,
-            kCIInputContrastKey: Knob.contrast
-        ]).cropped(to: extent)
+        var fills = structure
+        if Knob.posterizeLevels > 1 {
+            let stepped = structure.applyingFilter("CIColorPosterize", parameters: [
+                "inputLevels": Knob.posterizeLevels
+            ]).cropped(to: extent)
+            fills = stepped.applyingFilter("CIDissolveTransition", parameters: [
+                kCIInputTargetImageKey: structure,
+                kCIInputTimeKey: Knob.gradientKeep
+            ]).cropped(to: extent)
+        }
+        fills = shaded(graded(fills), structure: structure)
         if let history {
             fills = history.fills.blend(fills, keep: Knob.fillKeep)
         }
-        return fills
+        return Layers(fills: fills, structure: structure)
+    }
+
+    /// Grows a working-resolution layer to the size of `full`, snapping its borders to the edges in `full`.
+    static func painted(_ layer: CIImage, full: CIImage) -> CIImage {
+        upsample(layer.normalizedOrigin(), guide: full)
+    }
+
+    /// Flat regions with borders where the real edges are. Shrinking and median filtering wipe out
+    /// texture; the guided upsample puts the outlines of shapes back without the texture.
+    static func flattened(_ image: CIImage) -> CIImage {
+        let tiny = IllustrationStyle.downscaled(image, scale: Knob.flattenScale)
+        let tinyExtent = tiny.extent
+        var region = tiny.clampedToExtent()
+        for _ in 0..<max(Knob.flattenPasses, 1) {
+            region = region.applyingFilter("CIMedianFilter")
+        }
+        region = region
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: Knob.flattenBlur])
+            .cropped(to: tinyExtent)
+        return upsample(region, guide: image)
+    }
+
+    private static func upsample(_ small: CIImage, guide: CIImage) -> CIImage {
+        let extent = guide.extent
+        let parameters: [String: Any] = [
+            kCIInputImageKey: guide,
+            "inputSmallImage": small,
+            "inputSpatialSigma": Knob.upsampleSpatial,
+            "inputLumaSigma": Knob.upsampleLuma
+        ]
+        guard let output = CIFilter(name: "CIEdgePreserveUpsampleFilter", parameters: parameters)?.outputImage else {
+            return IllustrationStyle.upscaled(small, to: extent)
+        }
+        return output.cropped(to: extent)
+    }
+
+    private static func graded(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        let lift = Knob.coolLift
+        return image
+            .applyingFilter("CIExposureAdjust", parameters: ["inputEV": Knob.exposure])
+            .applyingFilter("CIVibrance", parameters: ["inputAmount": Knob.vibrance])
+            .applyingFilter("CIColorControls", parameters: [
+                kCIInputSaturationKey: Knob.saturation,
+                kCIInputBrightnessKey: Knob.brightness,
+                kCIInputContrastKey: Knob.contrast
+            ])
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 1 - lift, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: 1, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: 1, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+                "inputBiasVector": CIVector(x: 0, y: 0, z: lift, w: 0)
+            ])
+            .cropped(to: extent)
+    }
+
+    /// Dark areas get one flat cool shadow tone with a hard edge, instead of photo shading.
+    private static func shaded(_ fills: CIImage, structure: CIImage) -> CIImage {
+        let extent = fills.extent
+        let luminance = structure.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0,
+            kCIInputBrightnessKey: 0,
+            kCIInputContrastKey: 1
+        ]).cropped(to: extent)
+        let lit = luminance.applyingFilter("CIColorThreshold", parameters: ["inputThreshold": Knob.shadowLevel])
+            .cropped(to: extent)
+        let shadow = StableInk.opaque(StableInk.affine(lit, scale: -1, bias: 1))
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: Knob.shadowEdge])
+            .cropped(to: extent)
+        let tint = CIImage(color: Knob.shadowTint).cropped(to: extent)
+        let dark = tint.applyingFilter("CIMultiplyBlendMode", parameters: [
+            kCIInputBackgroundImageKey: fills
+        ]).cropped(to: extent)
+        return dark.applyingFilter("CIBlendWithMask", parameters: [
+            kCIInputBackgroundImageKey: fills,
+            kCIInputMaskImageKey: shadow
+        ]).cropped(to: extent)
     }
 
     /// White where there is an outline, black elsewhere, at the resolution of `full`.
@@ -155,7 +265,7 @@ enum SonnyBoyStyle {
 }
 
 /// Hand-drawn pieces for the swapped sky and ground, generated once per framing from a seed.
-/// Clouds are two-tone and flat. Waves and tufts are sparse strokes. Tiles are transparent.
+/// Clouds are painted cumulus from `SonnyBoyArt`. Waves and tufts are sparse strokes. Tiles are transparent.
 struct SonnyBoyTextures {
     let clouds: CIImage
     let waves: CIImage
@@ -163,12 +273,12 @@ struct SonnyBoyTextures {
 
     init(seed: UInt64) {
         var rng = SplitMix64(seed: seed)
-        clouds = SonnyBoyTextures.drawClouds(&rng)
+        clouds = SonnyBoyArt.paintedClouds(&rng)
         waves = SonnyBoyTextures.drawWaves(&rng)
         tufts = SonnyBoyTextures.drawTufts(&rng)
     }
 
-    private static func canvas(width: Int, height: Int) -> CGContext? {
+    static func canvas(width: Int, height: Int) -> CGContext? {
         CGContext(
             data: nil,
             width: width,
@@ -180,54 +290,12 @@ struct SonnyBoyTextures {
         )
     }
 
-    private static func finish(_ context: CGContext, width: Int, height: Int) -> CIImage {
+    static func finish(_ context: CGContext, width: Int, height: Int) -> CIImage {
         guard let image = context.makeImage() else {
             return CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0))
                 .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
         }
         return CIImage(cgImage: image)
-    }
-
-    private static func drawClouds(_ rng: inout SplitMix64) -> CIImage {
-        let width = 768
-        let height = 512
-        guard let context = canvas(width: width, height: height) else {
-            return CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0))
-                .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        let count = 3 + Int(rng.unit() * 2.99)
-        for index in 0..<count {
-            let slot = CGFloat(width) / CGFloat(count)
-            let cloudWidth = slot * (0.62 + rng.unit() * 0.3)
-            let left = slot * CGFloat(index) + (slot - cloudWidth) * 0.5
-            let base = CGFloat(height) * (0.12 + rng.unit() * 0.55)
-            let puffs = 4 + Int(rng.unit() * 3.99)
-            var circles: [CGRect] = []
-            for puff in 0..<puffs {
-                let t = (CGFloat(puff) + 0.5) / CGFloat(puffs)
-                let arch = 1 - abs(t - 0.5) * 1.4
-                let radius = cloudWidth * (0.12 + 0.12 * arch + rng.unit() * 0.05)
-                let x = left + cloudWidth * t
-                let y = base + radius * (0.35 + rng.unit() * 0.3)
-                circles.append(CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
-            }
-            let flatBottom = CGRect(x: left, y: base, width: cloudWidth, height: cloudWidth * 0.12)
-
-            let shade = SonnyBoyStyle.Knob.cloudShade
-            context.setFillColor(red: shade.red, green: shade.green, blue: shade.blue, alpha: 1)
-            for circle in circles {
-                context.fillEllipse(in: circle.offsetBy(dx: 0, dy: -circle.height * 0.08))
-            }
-            context.fill(flatBottom.offsetBy(dx: 0, dy: -flatBottom.height * 0.4))
-
-            context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
-            for circle in circles {
-                context.fillEllipse(in: circle.insetBy(dx: circle.width * 0.04, dy: circle.height * 0.04)
-                    .offsetBy(dx: 0, dy: circle.height * 0.05))
-            }
-        }
-        return finish(context, width: width, height: height)
     }
 
     private static func drawWaves(_ rng: inout SplitMix64) -> CIImage {
