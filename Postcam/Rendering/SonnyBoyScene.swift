@@ -67,16 +67,16 @@ struct SurrealPlan {
     }
 }
 
-/// Sonny Boy, surreal version. Everything is painted flat. People are found with person
-/// segmentation and stay as cel figures with dark outlines. Flat or very bright surfaces above the
-/// horizon (ceilings, walls, windows, real sky) become a cobalt sky with painted cumulus, sometimes
-/// with a whale swimming through it. Flat ground below usually stays, or becomes sea, sand, grass,
-/// or more sky. Up to two salient objects float above themselves with a soft shadow underneath.
+/// Sonny Boy, surreal version. The hand window is redrawn as an anime background by the Core ML
+/// model in `AnimeStylizer`; only that crop goes through the model. On top of the drawing, empty
+/// background above the horizon (ceilings, walls, windows, real sky) becomes a cobalt sky with
+/// painted cumulus, sometimes with a whale swimming through it, and never covers an object. Flat
+/// ground below usually stays, or becomes sea, sand, grass, or more sky. Up to two detected objects
+/// float above themselves with a soft shadow underneath.
 ///
-/// Fills, Vision, and the region masks run at `workScale`. Fills are grown back to full resolution
-/// with an edge-preserving upsample, so their borders are sharp. The outlines are traced and drawn
-/// at full resolution, so they stay thin. Live mode reuses masks between Vision passes and smooths them over time.
-/// Still mode runs every pass once at full strength.
+/// While the model loads, or if it cannot load, the drawing falls back to the Core Image cel
+/// filter (`SonnyBoyStyle.paint`). Vision and the region masks run at `workScale`. Live mode reuses
+/// masks between Vision passes and smooths them over time. Still mode runs every pass once.
 final class SonnyBoyScene {
     enum Knob {
         static let workScale: CGFloat = 0.42
@@ -121,6 +121,7 @@ final class SonnyBoyScene {
     private let regions: FrameHistory?
     private let lineHistory: FrameHistory?
     private let start = CFAbsoluteTimeGetCurrent()
+    private let anime = AnimeStylizer.shared
 
     private var person: CIImage?
     /// Foreground object instances (Vision, iOS 17), gray, at working size.
@@ -149,12 +150,15 @@ final class SonnyBoyScene {
 
     /// `horizon` is a 0...1 height, y-up. Surfaces above it may turn into sky; below it, ground.
     /// `framing` changes whenever a new hand frame starts, which picks a new plan.
-    /// `window` is the hand window in 0...1 coordinates, y-up; clouds and the whale are sized to it.
+    /// `window` is the hand window in 0...1 coordinates, y-up. Only it is redrawn by the model, and
+    /// clouds and the whale are sized to it. `waitForModel` runs the model on this exact frame
+    /// (for a photo) instead of showing the last live result.
     func render(
         _ image: CIImage,
         horizon: CGFloat,
         framing: Int,
-        window: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+        window: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1),
+        waitForModel: Bool = false
     ) -> CIImage {
         let full = image.normalizedOrigin()
         let fullExtent = full.extent
@@ -176,10 +180,20 @@ final class SonnyBoyScene {
             findSalient(small)
         }
 
-        let layers = SonnyBoyStyle.paint(full: full, small: small, history: cel, palette: palette)
-        let base = layers.fills
-        let lines = SonnyBoyStyle.lineMask(layers.regions, history: lineHistory)
         let windowRect = pixelRect(window, in: fullExtent)
+        let base: CIImage
+        let guide: CIImage
+        /// Traced outlines, only for the fallback filter; the model draws its own.
+        var lines: CIImage?
+        if let drawing = modelDrawing(full, window: windowRect, wait: still || waitForModel) {
+            base = drawing.image.composited(over: full).cropped(to: fullExtent)
+            guide = base
+        } else {
+            let layers = SonnyBoyStyle.paint(full: full, small: small, history: cel, palette: palette)
+            base = layers.fills
+            guide = layers.regions
+            lines = SonnyBoyStyle.lineMask(layers.regions, history: lineHistory)
+        }
         let level = min(max(horizon, 0.05), 0.95)
         let packed = regionMasks(small, horizonY: extent.minY + extent.height * level)
         let stable = regions?.blend(packed, keep: Knob.regionKeep) ?? packed
@@ -188,9 +202,9 @@ final class SonnyBoyScene {
         var ink = lines
         let time = CFAbsoluteTimeGetCurrent() - start
         if person != nil {
-            // Grown with the palette regions as the guide, then cut hard, so mask borders land on
-            // the same pixel-sharp borders as the fills instead of a stretched low-res blob.
-            let masks = SonnyBoyStyle.guidedUpsample(stable, guide: layers.regions)
+            // Grown with the drawing as the guide, then cut hard, so mask borders land on the
+            // drawing's own sharp borders instead of a stretched low-res blob.
+            let masks = SonnyBoyStyle.guidedUpsample(stable, guide: guide)
             let objectGuard = dilated(cut(grayChannel(masks, index: 2)), radius: Knob.objectMarginFull)
             let free = StableInk.affine(objectGuard, scale: -1, bias: 1)
             let sky = StableInk.multiply(cut(grayChannel(masks, index: 0)), free)
@@ -211,17 +225,39 @@ final class SonnyBoyScene {
                 ]).cropped(to: fullExtent)
             }
             // Contours inside a swapped area belong to the old wall or floor, so they are dropped.
-            let kept = StableInk.affine(brighter(sky, ground), scale: -1, bias: 1)
-            ink = brighter(StableInk.multiply(lines, kept), boundaries(sky: sky, ground: ground))
+            let edges = boundaries(sky: sky, ground: ground)
+            if let traced = lines {
+                let kept = StableInk.affine(brighter(sky, ground), scale: -1, bias: 1)
+                ink = brighter(StableInk.multiply(traced, kept), edges)
+            } else {
+                ink = edges
+            }
         }
-        scene = SonnyBoyStyle.inked(scene, lines: ink)
+        if let ink {
+            scene = SonnyBoyStyle.inked(scene, lines: ink)
+        }
 
         if plan.floats > 0, !floatBoxes.isEmpty, let objects {
-            let silhouettes = cut(SonnyBoyStyle.guidedUpsample(objects, guide: layers.regions))
-            let object = SonnyBoyStyle.inked(base, lines: lines)
+            let silhouettes = cut(SonnyBoyStyle.guidedUpsample(objects, guide: guide))
+            let object = lines.map { SonnyBoyStyle.inked(base, lines: $0) } ?? base
             scene = floating(object, over: scene, boxes: floatBoxes, silhouettes: silhouettes, extent: fullExtent, time: time)
         }
         return scene
+    }
+
+    /// The model's drawing of the window, slightly padded so the window edge is inside it.
+    /// Live, this is the last finished result, which may be a frame or two old.
+    private func modelDrawing(_ full: CIImage, window: CGRect, wait: Bool) -> AnimeStylizer.Result? {
+        let extent = full.extent
+        let pad = max(window.width, window.height) * 0.04
+        let rect = window.insetBy(dx: -pad, dy: -pad).intersection(extent).integral
+        guard !rect.isNull, rect.width >= 16, rect.height >= 16 else { return nil }
+        if wait {
+            return anime.stylizeNow(full, rect: rect)
+        }
+        guard anime.state == .ready else { return nil }
+        anime.submit(full, rect: rect)
+        return anime.latest(for: extent)
     }
 
     // MARK: - Plan
@@ -231,6 +267,9 @@ final class SonnyBoyScene {
         let mixed = sessionSeed ^ (UInt64(truncatingIfNeeded: framing) &* 0x9E3779B97F4A7C15)
         plan = SurrealPlan.make(seed: mixed, groundIsWater: lowerBandLooksLikeWater(sample))
         textures = SonnyBoyTextures(seed: plan.textureSeed)
+        if !still {
+            anime.reset()
+        }
         cel?.reset()
         palette?.reset()
         regions?.reset()

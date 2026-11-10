@@ -74,7 +74,13 @@ final class HandFrameTracker {
     func styled(_ image: CIImage, forceFull: Bool = false) -> CIImage {
         let source = image.normalizedOrigin()
         guard let mask = mask(for: source, forceFull: forceFull) else { return source }
-        let stylized = scene.render(source, horizon: windowHorizon(), framing: framing, window: windowBounds())
+        let stylized = scene.render(
+            source,
+            horizon: windowHorizon(),
+            framing: framing,
+            window: windowBounds(),
+            waitForModel: forceFull
+        )
         return stylized.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: source,
             kCIInputMaskImageKey: mask
